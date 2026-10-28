@@ -499,9 +499,11 @@ fn summarize_note(
 ) -> anyhow::Result<()> {
     use course2md::{artifact, execution};
     let dir = course2md::config::canonicalize(dir)?;
+    let read_guard = course2md::note_edit::read_guard(&dir)?;
     let base = artifact::read_manifest(&dir.join("manifest.json"))?;
     let document: artifact::Document =
         serde_json::from_slice(&std::fs::read(dir.join(&base.document))?)?;
+    drop(read_guard);
     if document.summary.is_some() && !force {
         if !progress::is_quiet() {
             println!(
@@ -573,6 +575,7 @@ fn summarize_note(
     ))??;
     let version = course_dir.join("versions").join(&task_id);
     if let Some(out) = out {
+        let _read_guard = course2md::note_edit::read_guard(&version)?;
         let manifest = artifact::read_manifest(&version.join("manifest.json"))?;
         let saved: artifact::Document =
             serde_json::from_slice(&std::fs::read(version.join(&manifest.document))?)?;

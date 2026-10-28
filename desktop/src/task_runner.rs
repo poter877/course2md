@@ -1799,6 +1799,7 @@ impl Desktop {
     ) {
         let done = self.pending_done.take();
         let manifest = done.as_ref().and_then(|d| {
+            let _read_guard = course2md::note_edit::read_guard(&d.out_dir).ok()?;
             course2md::artifact::read_manifest(&d.out_dir.join("manifest.json")).ok()
         });
         let Some(workspace) = &mut self.workspace else {

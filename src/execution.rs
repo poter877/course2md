@@ -297,6 +297,7 @@ impl Request {
                 components,
                 ..
             } => {
+                let _read_guard = crate::note_edit::read_guard(base_version_dir)?;
                 let manifest =
                     crate::artifact::read_manifest(&base_version_dir.join("manifest.json"))?;
                 serde_json::json!({"kind":"reprocess", "source_id":manifest.source_id, "base_version_id":manifest.version_id,"components":components})

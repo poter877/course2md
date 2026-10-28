@@ -88,6 +88,7 @@ fn assets_present(dir: &Path, manifest: &artifact::Manifest) -> bool {
 }
 
 fn version_course(dir: &Path) -> Result<Course> {
+    let _read_guard = course2md::note_edit::read_guard(dir)?;
     let manifest = artifact::read_manifest(&dir.join("manifest.json"))?;
     anyhow::ensure!(
         artifact::safe_asset_path(dir, &manifest.document).is_ok_and(|path| path.is_file()),
@@ -337,12 +338,11 @@ pub struct Preview {
 }
 
 pub fn read_preview(mut course: Course) -> Result<Preview> {
-    let manifest = match course.manifest.take() {
-        Some(manifest) => manifest,
-        None => {
-            artifact::read_manifest(&course.dir.join("manifest.json")).context(body_unreadable())?
-        }
-    };
+    let _read_guard = course2md::note_edit::read_guard(&course.dir)?;
+    // A scan's manifest can predate an edit or crash recovery. Always open the
+    // current snapshot instead of pairing cached hashes with a different body.
+    let manifest =
+        artifact::read_manifest(&course.dir.join("manifest.json")).context(body_unreadable())?;
     let document: artifact::Document = serde_json::from_slice(&std::fs::read(
         artifact::safe_asset_path(&course.dir, &manifest.document)?,
     )?)?;

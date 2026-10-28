@@ -224,6 +224,7 @@ pub fn published(target: &Target) -> Result<Option<Manifest>> {
     if !dir.exists() {
         return Ok(None);
     }
+    let _read_guard = crate::note_edit::read_guard(&dir)?;
     let manifest = read_manifest(&dir.join("manifest.json"))?;
     anyhow::ensure!(
         manifest.task_id == target.task_id
@@ -473,7 +474,13 @@ fn publish_in_task(
     for format in formats {
         let name = crate::portable::file_name(*format);
         let path = staging.path().join("exports").join(name);
-        match crate::portable::write_document(staging.path(), &document, *format, &path) {
+        match crate::portable::write_document_in_task(
+            staging.path(),
+            &document,
+            *format,
+            &path,
+            control,
+        ) {
             Ok(_) => {
                 outputs.push(format!("exports/{name}"));
                 outcomes

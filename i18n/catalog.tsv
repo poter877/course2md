@@ -2206,7 +2206,49 @@ Intel NPU 不再支持 Qwen3 模型。可用：{}	Intel NPU 不再支持 Qwen3 �
 已在设置中关闭 AI 处理：不运行校对、摘要、截图辅助与翻译。	已在设置中关闭 AI 处理：不运行校对、摘要、截图辅助与翻译。	AI processing is off in Settings: proofreading, summaries, image-assisted proofreading and translation will not run.	已在設定中關閉 AI 處理：不執行校對、摘要、截圖輔助與翻譯。	設定で AI 処理をオフにしています：校正・要約・画像補助・翻訳は実行されません。
 启用 AI 处理	启用 AI 处理	Enable AI processing	啟用 AI 處理	AI 処理を有効にする
 视频画面（无对应幻灯片）	视频画面（无对应幻灯片）	Video screen (no matching slide)	影片畫面（無對應投影片）	映像画面（対応スライドなし）
+AI 翻译整篇	AI 翻译整篇	Translate whole note with AI	AI 翻譯整篇	AI でノート全体を翻訳
+撤销这次 AI 翻译	撤销这次 AI 翻译	Undo this AI translation	撤銷這次 AI 翻譯	この AI 翻訳を元に戻す
+正在翻译整篇笔记…	正在翻译整篇笔记…	Translating the whole note…	正在翻譯整篇筆記…	ノート全体を翻訳しています…
+已翻译 {}/{} 段	已翻译 {}/{} 段	Translated {}/{} passages	已翻譯 {}/{} 段	{}/{} 段落を翻訳しました
+翻译时意外中断，请重试	翻译时意外中断，请重试	Translation was interrupted; try again	翻譯時意外中斷，請重試	翻訳が中断されました。再試行してください
+撤销时意外中断，请重试	撤销时意外中断，请重试	Undo was interrupted; try again	撤銷時意外中斷，請重試	元に戻す処理が中断されました。再試行してください
+已撤销这次 AI 翻译	已撤销这次 AI 翻译	AI translation undone	已撤銷這次 AI 翻譯	この AI 翻訳を元に戻しました
+这份笔记没有可撤销的 AI 编辑 / No AI edit to undo	这份笔记没有可撤销的 AI 编辑 / No AI edit to undo	This note has no AI edit to undo	這份筆記沒有可撤銷的 AI 編輯 / No AI edit to undo	このノートには元に戻せる AI 編集がありません
+AI 处理本段	AI 处理本段	AI edit this paragraph	AI 處理本段	この段落を AI 編集
+AI 清理语气词	AI 清理语气词	Remove filler words	AI 清理語氣詞	フィラーを削除
+AI 翻译本段	AI 翻译本段	Translate this paragraph	AI 翻譯本段	この段落を翻訳
+AI 优化本段	AI 优化本段	Improve this paragraph	AI 優化本段	この段落を改善
+正在处理本段…	正在处理本段…	Editing this paragraph…	正在處理本段…	この段落を処理しています…
+已更新本段	已更新本段	Paragraph updated	已更新本段	段落を更新しました
+服务没有返回这一段的编辑结果	服务没有返回这一段的编辑结果	The service returned no result for this paragraph	服務沒有回傳這一段的編輯結果	この段落の編集結果が返されませんでした
+删除语气词、重复和口误，保留有用信息，不新增事实。	删除语气词、重复和口误，保留有用信息，不新增事实。	Remove filler words, repetitions and slips while keeping the useful information; add no new facts.	刪除語氣詞、重複和口誤，保留有用資訊，不新增事實。	フィラー・繰り返し・言い間違いを削除し、有用な情報を残す。新しい事実は追加しない。
+润色文字，保持原意与术语，不新增事实。	润色文字，保持原意与术语，不新增事实。	Polish the text while keeping its meaning and terms; add no new facts.	潤色文字，保持原意與術語，不新增事實。	表現を整え、意味と用語を保つ。新しい事実は追加しない。
+把原文翻译为目标语言，不改写原文。	把原文翻译为目标语言，不改写原文。	Translate into the target language without rewriting the source.	把原文翻譯為目標語言，不改寫原文。	原文を目標言語に翻訳し、原文は改写しない。
+处理本段时意外中断，请重试	处理本段时意外中断，请重试	Editing was interrupted; try again	處理本段時意外中斷，請重試	段落の処理が中断されました。再試行してください
+translation 用 {} 输出 polished 的译文。	translation 用 {} 输出 polished 的译文。	Write the polished text's translation in {}.	translation 用 {} 輸出 polished 的譯文。	translation は {} で polished の訳文を出力する。
+无法读取图片	无法读取图片	Cannot read the image	無法讀取圖片	画像を読み込めません
+附带图片只用于理解原文，不要描述图片本身。	附带图片只用于理解原文，不要描述图片本身。	Attached images are only for understanding the text; do not describe the images.	附帶圖片只用於理解原文，不要描述圖片本身。	添付画像は原文の理解のみに使い、画像自体の説明はしない。
+取消 AI 编辑	取消 AI 编辑	Cancel AI edit	取消 AI 編輯	AI 編集をキャンセル
+已取消 AI 编辑	已取消 AI 编辑	AI edit cancelled	已取消 AI 編輯	AI 編集をキャンセルしました
+AI 预览 · {}	AI 预览 · {}	AI preview · {}	AI 預覽 · {}	AI プレビュー · {}
+结果：{}	结果：{}	Result: {}	結果：{}	結果：{}
+保留片段：{}	保留片段：{}	Kept passages: {}	保留片段：{}	保持する部分：{}
+丢弃	丢弃	Discard	丟棄	破棄
+AI 结果已生成，确认后写回	AI 结果已生成，确认后写回	AI result is ready; review and apply	AI 結果已生成，確認後寫回	AI の結果ができました。確認してから書き戻します
+已放弃这次 AI 结果	已放弃这次 AI 结果	Discarded this AI result	已放棄這次 AI 結果	この AI 結果を破棄しました
+写回时意外中断，请重试	写回时意外中断，请重试	Writing back was interrupted; try again	寫回時意外中斷，請重試	書き戻しが中断されました。再試行してください
+优化	优化	Improve	優化	改善
+原文：{}	原文：{}	Original: {}	原文：{}	原文：{}
+清理语气词	清理语气词	Clean filler words	清理語氣詞	フィラーを削除
 翻译	翻译	Translation	翻譯	翻訳
+先在 设置 → 服务 里添加 AI 服务并设为默认	先在 设置 → 服务 里添加 AI 服务并设为默认	Add an AI service in Settings → Services and make it the default	先在 設定 → 服務 裡新增 AI 服務並設為預設	設定 → サービス で AI サービスを追加し、既定に設定してください
+{} · {} 秒	{} · {} 秒	{} · {}s	{} · {} 秒	{} · {} 秒
+知道了	知道了	Got it	知道了	わかりました
+AI 优化本段（带本段截图）	AI 优化本段（带本段截图）	Improve this paragraph with its note screenshot	AI 優化本段（帶本段截圖）	この段落のスクリーンショット付きで改善
+本段没有可用的笔记截图，改为只读文字	本段没有可用的笔记截图，改为只读文字	This paragraph has no note screenshot; using text only	本段沒有可用的筆記截圖，改為只讀文字	この段落にスクリーンショットがないため、テキストのみで処理します
+笔记编辑恢复记录无效，原文件已保留	笔记编辑恢复记录无效，原文件已保留	The note edit recovery record is invalid; original files have been kept.	筆記編輯復原記錄無效，原始檔案已保留	ノート編集の復元記録が無効です。元のファイルは保持されています。
+笔记已发生变化，请重新选择文字后再试	笔记已发生变化，请重新选择文字后再试	The note has changed. Select the text again and retry.	筆記已發生變化，請重新選取文字後再試	ノートが変更されました。テキストを選び直して再試行してください。
+笔记编辑尚未恢复，请重试；恢复副本已保留	笔记编辑尚未恢复，请重试；恢复副本已保留	The note edit has not been restored. Retry; the recovery copy has been kept.	筆記編輯尚未復原，請重試；復原副本已保留	ノート編集を復元できていません。再試行してください。復元用コピーは保持されています。
 无法读取截图用于对齐：{}	无法读取截图用于对齐：{}	Cannot read screenshot for alignment: {}	無法讀取截圖以進行對齊：{}	位置合わせ用のスクリーンショットを読み取れません：{}
 找不到幻灯片 PDF：{}	找不到幻灯片 PDF：{}	Slide PDF not found: {}	找不到投影片 PDF：{}	スライド PDF が見つかりません：{}
 幻灯片渲染页码不完整或不一致：{}	幻灯片渲染页码不完整或不一致：{}	Rendered slide pages are incomplete or inconsistent: {}	投影片轉圖頁碼不完整或不一致：{}	描画されたスライドのページ番号が不完全または不一致です：{}
@@ -2216,3 +2258,4 @@ Intel NPU 不再支持 Qwen3 模型。可用：{}	Intel NPU 不再支持 Qwen3 �
 无法启动 {}；请安装 Poppler（pdftoppm / pdftotext）以使用幻灯片 PDF	无法启动 {}；请安装 Poppler（pdftoppm / pdftotext）以使用幻灯片 PDF	Cannot start {}. Install Poppler (pdftoppm / pdftotext) to use slide PDFs.	無法啟動 {}；請安裝 Poppler（pdftoppm / pdftotext）以使用投影片 PDF	{} を起動できません。スライド PDF を使用するには Poppler（pdftoppm / pdftotext）をインストールしてください。
 外部工具 {} 执行失败（退出码 {}）：{}	外部工具 {} 执行失败（退出码 {}）：{}	External tool {} failed (exit code {}): {}	外部工具 {} 執行失敗（結束代碼 {}）：{}	外部ツール {} の実行に失敗しました（終了コード {}）：{}
 幻灯片临时路径无效	幻灯片临时路径无效	The slide temporary path is invalid.	投影片暫存路徑無效	スライドの一時パスが無効です。
+笔记内容已变化，请重新打开后再试	笔记内容已变化，请重新打开后再试	The note has changed. Reopen it and retry.	筆記內容已變更，請重新開啟後再試	ノートの内容が変更されました。開き直して再試行してください。

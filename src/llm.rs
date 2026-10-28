@@ -354,6 +354,194 @@ pub fn translate_sections_report(
     })
 }
 
+/// 一次模型调用返回的选区编辑结果：保留范围 + 清理后 + 润色后 + 译文。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RegionEdit {
+    pub id: usize,
+    /// 原文里的有用片段（UTF-8 字节范围，左闭右开）。
+    pub keep: Vec<(usize, usize)>,
+    pub cleaned: String,
+    pub polished: String,
+    pub translation: Option<String>,
+}
+
+/// 对选中片段做一次调用，同时得到清理/润色/翻译/保留范围，节省调用次数。
+/// `items` 是 (段落 id, 原文)，图片会作为同一条消息的附加内容发一次。
+pub fn enhance_regions(
+    settings: &LlmSettings,
+    items: &[(usize, String)],
+    instruction: Option<&str>,
+    target: Option<&str>,
+    images: &[std::path::PathBuf],
+) -> Result<Vec<RegionEdit>> {
+    enhance_regions_in_task(
+        settings,
+        items,
+        instruction,
+        target,
+        images,
+        &crate::dispatch::TaskControl::default(),
+    )
+}
+
+/// Region editing shares the caller's cancellation and request retry boundaries.
+pub fn enhance_regions_in_task(
+    settings: &LlmSettings,
+    items: &[(usize, String)],
+    instruction: Option<&str>,
+    target: Option<&str>,
+    images: &[std::path::PathBuf],
+    control: &crate::dispatch::TaskControl,
+) -> Result<Vec<RegionEdit>> {
+    control.check()?;
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+    let payload: Vec<serde_json::Value> = items
+        .iter()
+        .map(|(id, text)| serde_json::json!({"id": id, "text": text}))
+        .collect();
+    let mut content = vec![serde_json::json!({
+        "type": "text",
+        "text": serde_json::to_string(&payload)?,
+    })];
+    for path in images {
+        use base64::Engine as _;
+        control.check()?;
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("{}: {}", crate::tr!("无法读取图片"), path.display()))?;
+        control.check()?;
+        let mime = match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("webp") => "image/webp",
+            _ => "image/jpeg",
+        };
+        content.push(serde_json::json!({
+            "type": "image_url",
+            "image_url": {"url": format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(bytes))},
+        }));
+    }
+    let translation_rule = target.map_or_else(String::new, |target| {
+        crate::tr!(
+            "translation 用 {} 输出 polished 的译文。",
+            crate::language::native_name(target)
+        )
+    });
+    let instruction = instruction.unwrap_or("").trim();
+    let system = format!(
+        "{} {MATH_RULE} {} {} 输出 JSON 对象 {{\"edits\":[{{\"id\":序号,\"keep\":[[起,止]],\"cleaned\":\"删去语气词/重复后的文本\",\"polished\":\"在 cleaned 基础上去掉口误、保持原意\",\"translation\":\"译文或空字符串\"}}]}}；keep 用 UTF-8 字节范围标出原文中有用、值得保留的片段。只处理给定文本，不添加未出现的信息。{}",
+        effective_prompt(settings),
+        instruction,
+        if images.is_empty() {
+            ""
+        } else {
+            crate::tr!("附带图片只用于理解原文，不要描述图片本身。")
+        },
+        translation_rule,
+    );
+    let body = crate::provider::chat_body(
+        settings,
+        &system,
+        serde_json::Value::Array(content),
+        CHAT_MAX_TOKENS,
+    );
+    let agent = chat_agent();
+    let description = crate::tr!("优化笔记选中片段 / Improve selected note text");
+    let validate = |content: &str| {
+        anyhow::ensure!(
+            parse_regions(content).is_some(),
+            crate::tr!("服务返回的编辑结构无效 / Invalid edit structure")
+        );
+        Ok(())
+    };
+    let content = send_chat_described(
+        &agent,
+        control,
+        settings,
+        &body,
+        Purpose::Proofreading,
+        description,
+        &validate,
+    )?;
+    control.check()?;
+    let mut edits = parse_regions(&content).context(crate::tr!(
+        "服务返回的编辑结构无效 / Invalid edit structure"
+    ))?;
+    let expected: std::collections::HashSet<usize> = items.iter().map(|(id, _)| *id).collect();
+    anyhow::ensure!(
+        edits.len() == expected.len() && edits.iter().all(|edit| expected.contains(&edit.id)),
+        crate::tr!("编辑结果与选中片段不对应 / Edit ids do not match the selected text")
+    );
+    edits.sort_by_key(|edit| edit.id);
+    Ok(edits)
+}
+
+fn parse_regions(content: &str) -> Option<Vec<RegionEdit>> {
+    let object = extract_json_object(content)?;
+    let edits = object.get("edits")?.as_array()?;
+    let mut out = Vec::with_capacity(edits.len());
+    for edit in edits {
+        let id = edit.get("id")?.as_u64()? as usize;
+        let keep = edit
+            .get("keep")
+            .and_then(|value| value.as_array())
+            .map(|pairs| {
+                pairs
+                    .iter()
+                    .filter_map(|pair| {
+                        let range = pair.as_array()?;
+                        let start = range.first()?.as_u64()? as usize;
+                        let end = range.get(1)?.as_u64()? as usize;
+                        (start < end).then_some((start, end))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cleaned = edit
+            .get("cleaned")
+            .and_then(|value| value.as_str())?
+            .to_owned();
+        let polished = edit
+            .get("polished")
+            .and_then(|value| value.as_str())
+            .unwrap_or(&cleaned)
+            .to_owned();
+        let translation = edit
+            .get("translation")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
+        out.push(RegionEdit {
+            id,
+            keep,
+            cleaned,
+            polished,
+            translation,
+        });
+    }
+    Some(out)
+}
+
+/// 给已有笔记原地补翻译：只覆盖 `sections[].speech[].translation`。
+pub fn translate_document(
+    document: &mut crate::artifact::Document,
+    settings: &LlmSettings,
+    target: &str,
+) -> Result<PolishReport> {
+    translate_sections_report(
+        &mut document.sections,
+        settings,
+        target,
+        &crate::dispatch::TaskControl::default(),
+    )
+}
+
 fn translate_chunk(
     agent: &ureq::Agent,
     control: &crate::dispatch::TaskControl,
@@ -1411,5 +1599,96 @@ mod tests {
         assert_eq!(got, vec![(0, "a".into()), (1, "b".into())]);
         assert!(parse_id_text_pairs(crate::tr!("没有数组")).is_none());
         assert!(parse_id_text_pairs("[]").is_none());
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    #[test]
+    fn pre_cancelled_region_edit_does_not_read_images_or_send_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let settings = LlmSettings {
+            base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            api_key: "test".into(),
+            model: "test".into(),
+            ..LlmSettings::default()
+        };
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let control = crate::dispatch::TaskControl::with_cancel_flag(cancelled);
+        let temp = tempfile::tempdir().unwrap();
+        for images in [Vec::new(), vec![temp.path().join("missing-image.png")]] {
+            let error = enhance_regions_in_task(
+                &settings,
+                &[(0, "hello there".into())],
+                None,
+                None,
+                &images,
+                &control,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), crate::tr!("已取消 AI 编辑"));
+        }
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    fn serve_once(reply: String) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = vec![0u8; 65536];
+            let _ = stream.read(&mut buf);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                reply.len(),
+                reply
+            );
+            let _ = stream.write_all(response.as_bytes());
+        });
+        port
+    }
+
+    #[test]
+    fn enhance_regions_parses_single_call_results() {
+        let content = serde_json::json!({
+            "edits": [{
+                "id": 0,
+                "keep": [[0, 5]],
+                "cleaned": "hello there",
+                "polished": "Hello there.",
+                "translation": "你好"
+            }]
+        });
+        let reply = serde_json::json!({
+            "choices": [{"message": {"content": content.to_string()}}]
+        })
+        .to_string();
+        let port = serve_once(reply);
+        let settings = LlmSettings {
+            base_url: format!("http://127.0.0.1:{port}/v1"),
+            api_key: "test".into(),
+            model: "test".into(),
+            ..LlmSettings::default()
+        };
+        let edits = enhance_regions(
+            &settings,
+            &[(0, "hello there".into())],
+            None,
+            Some("zh-Hans"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(edits.len(), 1);
+        assert_eq!(edits[0].keep, vec![(0, 5)]);
+        assert_eq!(edits[0].polished, "Hello there.");
+        assert_eq!(edits[0].translation.as_deref(), Some("你好"));
     }
 }

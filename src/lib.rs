@@ -20,6 +20,7 @@ pub mod login;
 pub mod math;
 pub mod media;
 pub mod models;
+pub mod note_edit;
 pub mod npu;
 pub mod options;
 pub mod pipeline;

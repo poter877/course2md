@@ -726,6 +726,9 @@ impl Desktop {
         if !this.preferences.application().desktop.setup_completed {
             this.start_onboarding(window, cx);
         }
+        if let Some(spec) = std::env::var_os("COURSE2MD_AI_E2E") {
+            this.start_ai_edit_e2e(spec.to_string_lossy().into_owned(), window, cx);
+        }
         this
     }
     /// Reports record writes that failed after the event loop moved on, and
@@ -1352,6 +1355,7 @@ impl Desktop {
         // Reading needs its own copy on the worker; rendering shares the rest.
         let course = Rc::unwrap_or_clone(course);
         self.save_reading_position(cx);
+        self.release_reader_images(cx);
         let reader_revision = self.read_generation;
         let reader_origin = follow.as_ref().and_then(|follow| {
             if !matches!(follow, import_ui::ConversionFollow::ReaderTask { .. }) {

@@ -405,6 +405,187 @@ fn reader_export_items(
     menu
 }
 
+/// 一次段落 AI 编辑的待确认结果：先给用户看，再决定写回。
+#[derive(Clone)]
+struct AiPreview {
+    request: AiEditRequest,
+    document_revision: String,
+    section: usize,
+    speech: usize,
+    mode: AiRegionMode,
+    original: String,
+    edit: course2md::llm::RegionEdit,
+}
+
+impl AiPreview {
+    fn matches_reader(&self, generation: u64, current: &notes::Preview) -> bool {
+        self.request
+            .matches_reader(generation, Some(&current.course.dir))
+            && current
+                .document
+                .sections
+                .get(self.section)
+                .and_then(|section| section.speech.get(self.speech))
+                .is_some_and(|event| event.text == self.original)
+    }
+
+    fn save(&self, cancelled: &Arc<AtomicBool>) -> anyhow::Result<()> {
+        let (text, translation) = match self.mode {
+            AiRegionMode::Clean => (self.edit.cleaned.as_str(), None),
+            AiRegionMode::Polish => (self.edit.polished.as_str(), None),
+            AiRegionMode::Translate => (self.original.as_str(), self.edit.translation.as_deref()),
+        };
+        course2md::note_edit::apply_region_edit_checked(
+            &self.request.version,
+            self.section,
+            self.speech,
+            text,
+            translation,
+            &self.document_revision,
+            cancelled,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct AiEditRequest {
+    version: PathBuf,
+    read_generation: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl AiEditRequest {
+    fn matches_reader(&self, generation: u64, version: Option<&std::path::Path>) -> bool {
+        self.read_generation == generation && version == Some(self.version.as_path())
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[derive(Default)]
+struct AiEditState {
+    pending: Option<AiEditRequest>,
+    status: Option<SharedString>,
+    started: Option<std::time::Instant>,
+    preview: Option<AiPreview>,
+}
+
+impl AiEditState {
+    fn busy(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    fn owns(&self, request: &AiEditRequest) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.cancelled, &request.cancelled))
+    }
+
+    fn begin(&mut self, version: PathBuf, read_generation: u64) -> AiEditRequest {
+        self.cancel();
+        let request = AiEditRequest {
+            version,
+            read_generation,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        self.pending = Some(request.clone());
+        self.started = Some(std::time::Instant::now());
+        request
+    }
+
+    fn cancel(&self) {
+        if let Some(request) = &self.pending {
+            request
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.cancel();
+        *self = Self::default();
+    }
+
+    /// A late callback must not clear a newer request or revive an old preview.
+    fn finish(
+        &mut self,
+        request: &AiEditRequest,
+        generation: u64,
+        version: Option<&std::path::Path>,
+    ) -> bool {
+        if !self.owns(request) {
+            return false;
+        }
+        if !request.matches_reader(generation, version) {
+            self.reset();
+            return false;
+        }
+        self.pending = None;
+        self.started = None;
+        true
+    }
+
+    fn saved_preview(&mut self, result: &anyhow::Result<()>) {
+        // Keep the exact draft and its expectation on failure, including cancellation.
+        if result.is_ok() {
+            self.preview = None;
+        }
+    }
+
+    /// Refresh only when there are translated passages to display. A transport
+    /// success can still contain partial or complete per-passage failure.
+    fn translated(&mut self, result: &anyhow::Result<course2md::note_edit::EditReport>) -> bool {
+        let (status, refresh) = match result {
+            Ok(report) => {
+                let mut status = if report.failed > 0 {
+                    course2md::tr!(
+                        "翻译未全部完成（{}/{} 失败）",
+                        report.failed,
+                        report.attempted
+                    )
+                } else {
+                    course2md::tr!("已翻译 {}/{} 段", report.succeeded, report.attempted)
+                };
+                if let Some(note) = report
+                    .note
+                    .as_deref()
+                    .filter(|note| !note.trim().is_empty())
+                {
+                    status.push('\n');
+                    status.push_str(note);
+                }
+                (status, report.succeeded > 0)
+            }
+            Err(error) => (format!("{error:#}"), false),
+        };
+        self.status = Some(status.into());
+        refresh
+    }
+
+    fn generated_preview(
+        &mut self,
+        request: &AiEditRequest,
+        result: anyhow::Result<Option<AiPreview>>,
+    ) {
+        // Cancellation can arrive after the worker sent its result.
+        let result = if request.is_cancelled() {
+            Ok(None)
+        } else {
+            result
+        };
+        match result {
+            Ok(Some(preview)) => {
+                self.preview = Some(preview);
+                self.status = Some(course2md::tr!("AI 结果已生成，确认后写回").into());
+            }
+            Ok(None) => self.status = Some(course2md::tr!("已取消 AI 编辑").into()),
+            Err(error) => self.status = Some(format!("{error:#}").into()),
+        }
+    }
+}
+
 pub(crate) struct State {
     controls_scroll: ScrollHandle,
     information_scroll: ScrollHandle,
@@ -425,6 +606,8 @@ pub(crate) struct State {
     loaded: Option<PathBuf>,
     generation: u64,
     data_loading: bool,
+    /// AI 编辑（原地写回）正在进行的标记与最近一次结果。
+    ai_edit: AiEditState,
     frames: Rc<Vec<Frame>>,
     frame_by_path: Rc<HashMap<PathBuf, usize>>,
     missing_by_block: Rc<HashMap<usize, Vec<usize>>>,
@@ -641,6 +824,7 @@ impl State {
             loaded: None,
             generation: 0,
             data_loading: false,
+            ai_edit: AiEditState::default(),
             frames: Rc::default(),
             frame_by_path: Rc::default(),
             missing_by_block: Rc::default(),
@@ -1524,7 +1708,7 @@ fn render_note_block(
 }
 
 fn note_paragraph(flow: &NoteFlow, index: usize, text: &SharedString, anchor: &str) -> AnyElement {
-    paragraph(
+    let body = paragraph(
         SharedString::from(anchor.to_owned()),
         text.clone(),
         index,
@@ -1532,8 +1716,117 @@ fn note_paragraph(flow: &NoteFlow, index: usize, text: &SharedString, anchor: &s
         flow.search_target(index),
         crate::note_text::Copy::Plain,
         TextPlace::Article,
-    )
-    .into_any_element()
+    );
+    let Some((section, speech)) = paragraph_target(anchor) else {
+        return body.into_any_element();
+    };
+    let weak = flow.desktop.clone();
+    let clean = weak.clone();
+    let translate = weak.clone();
+    let polish = weak.clone();
+    let more_weak = weak;
+    let action = quiet(("paragraph-ai", index))
+        .icon(icons::text_lines())
+        .tooltip(course2md::tr!("AI 处理本段"))
+        .dropdown_menu(move |menu, _, _| {
+            menu.item(
+                PopupMenuItem::new(course2md::tr!("AI 清理语气词"))
+                    .icon(icons::text_lines())
+                    .on_click({
+                        let weak = clean.clone();
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.start_ai_region(
+                                    section,
+                                    speech,
+                                    AiRegionMode::Clean,
+                                    Vec::new(),
+                                    cx,
+                                );
+                            });
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(course2md::tr!("AI 翻译本段"))
+                    .icon(icons::text_lines())
+                    .on_click({
+                        let weak = translate.clone();
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.start_ai_region(
+                                    section,
+                                    speech,
+                                    AiRegionMode::Translate,
+                                    Vec::new(),
+                                    cx,
+                                );
+                            });
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(course2md::tr!("AI 优化本段"))
+                    .icon(icons::text_lines())
+                    .on_click({
+                        let weak = polish.clone();
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.start_ai_region(
+                                    section,
+                                    speech,
+                                    AiRegionMode::Polish,
+                                    Vec::new(),
+                                    cx,
+                                );
+                            });
+                        }
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(course2md::tr!("AI 优化本段（带本段截图）"))
+                    .icon(icons::image())
+                    .on_click({
+                        let weak = more_weak.clone();
+                        move |_, _, cx| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.start_ai_region_with_image(section, speech, cx);
+                            });
+                        }
+                    }),
+            )
+        });
+    // 段落 AI 入口只在悬停该段时出现，避免每段都挂一个常驻图标。
+    let group_name = SharedString::from(format!("paragraph-row-{index}"));
+    h_flex()
+        .w_full()
+        .min_w_0()
+        .items_start()
+        .gap_2()
+        .group(group_name.clone())
+        .child(div().min_w_0().flex_1().child(body))
+        .child(
+            div()
+                .flex_shrink_0()
+                .opacity(0.0)
+                .group_hover(group_name, |style| style.opacity(1.0))
+                .child(action),
+        )
+        .into_any_element()
+}
+
+/// `paragraph-<section>-<speech>` 锚点解析为写回所需的下标。
+fn paragraph_target(anchor: &str) -> Option<(usize, usize)> {
+    let rest = anchor.strip_prefix("paragraph-")?;
+    let (section, speech) = rest.split_once('-')?;
+    Some((section.parse().ok()?, speech.parse().ok()?))
+}
+
+#[derive(Clone, Copy)]
+enum AiRegionMode {
+    Clean,
+    Translate,
+    Polish,
 }
 
 /// A translation reads as a quieter companion to the paragraph above it.
@@ -2445,8 +2738,33 @@ impl Desktop {
         let Some(preview) = &self.preview else {
             return;
         };
+        if self
+            .reader_ui
+            .ai_edit
+            .pending
+            .as_ref()
+            .is_some_and(|request| {
+                !request.matches_reader(self.read_generation, Some(&preview.course.dir))
+            })
+            || self
+                .reader_ui
+                .ai_edit
+                .preview
+                .as_ref()
+                .is_some_and(|draft| !draft.matches_reader(self.read_generation, preview))
+        {
+            self.reader_ui.ai_edit.reset();
+        }
         if self.reader_ui.loaded.as_ref() == Some(&preview.course.dir) {
             return;
+        }
+        if self
+            .reader_ui
+            .loaded
+            .as_ref()
+            .is_some_and(|loaded| loaded != &preview.course.dir)
+        {
+            self.reader_ui.ai_edit.reset();
         }
         self.reader_ui.loaded = Some(preview.course.dir.clone());
         self.reader_ui
@@ -2983,10 +3301,516 @@ impl Desktop {
         self.reader_ui.restore.active = false;
         cx.notify();
     }
+    fn ai_edit_target(&self) -> String {
+        self.preferences
+            .generation()
+            .ai
+            .translate
+            .clone()
+            .filter(|code| course2md::language::target(code).is_some())
+            .unwrap_or_else(|| "zh-Hans".to_owned())
+    }
+
+    /// 每秒刷新一次，让进行中的耗时可见。
+    fn tick_ai_edit_progress(&mut self, cx: &mut Context<Self>) {
+        let Some(request) = self.reader_ui.ai_edit.pending.clone() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if !this.reader_ui.ai_edit.owns(&request) {
+                            return false;
+                        }
+                        if this.page != Page::Result
+                            || !request.matches_reader(
+                                this.read_generation,
+                                this.preview
+                                    .as_ref()
+                                    .map(|preview| preview.course.dir.as_path()),
+                            )
+                        {
+                            this.reader_ui.ai_edit.reset();
+                            cx.notify();
+                            return false;
+                        }
+                        if this.reader_ui.ai_edit.busy() {
+                            cx.notify();
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// 运行整篇翻译；`result_marker` 只在测试链路使用：完成后写结果并退出。
+    fn run_ai_translate(
+        &mut self,
+        settings: course2md::llm::LlmSettings,
+        target: String,
+        result_marker: Option<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reader_ui.ai_edit.busy() || self.reading {
+            return;
+        }
+        let Some(preview) = self.preview.clone() else {
+            return;
+        };
+        let version = preview.course.dir.clone();
+        let course = preview.course.clone();
+        let document = preview.document.clone();
+        let request = self
+            .reader_ui
+            .ai_edit
+            .begin(version.clone(), self.read_generation);
+        self.reader_ui.ai_edit.preview = None;
+        self.reader_ui.ai_edit.status = Some(course2md::tr!("正在翻译整篇笔记…").into());
+        self.tick_ai_edit_progress(cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let cancelled = request.cancelled.clone();
+            let result = crate::spawn_blocking_io(move || {
+                let revision = course2md::note_edit::document_revision_for(&version, &document)?;
+                course2md::note_edit::translate_in_place_checked(
+                    &version, &settings, &target, &revision, &cancelled,
+                )
+            })
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(course2md::tr!("翻译时意外中断，请重试"))));
+            let _ = this.update(cx, |this, cx| {
+                if !this.finish_ai_request(&request) {
+                    return;
+                }
+                if this.reader_ui.ai_edit.translated(&result) {
+                    this.load_reader_version(course.clone(), true, cx);
+                }
+                if let Some(path) = &result_marker {
+                    let complete = result.as_ref().is_ok_and(|report| report.failed == 0);
+                    let payload = serde_json::json!({
+                        "ok": complete,
+                        "status": this.reader_ui.ai_edit.status.clone(),
+                        "error": (!complete).then(|| this.reader_ui.ai_edit.status.clone()).flatten(),
+                    });
+                    if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
+                        let _ = std::fs::write(path, bytes);
+                    }
+                    std::process::exit(0);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 测试钩子：加载指定版本，用本地假服务跑一遍整篇翻译，写结果后退出。
+    pub(crate) fn start_ai_edit_e2e(
+        &mut self,
+        spec: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut parts = spec.split('|');
+        let (Some(version), Some(endpoint), Some(model), Some(result)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return;
+        };
+        let version = std::path::PathBuf::from(version);
+        let endpoint = endpoint.to_owned();
+        let model = model.to_owned();
+        let result = std::path::PathBuf::from(result);
+        let course = crate::notes::Course {
+            dir: version.clone(),
+            title: "e2e".into(),
+            modified: std::time::SystemTime::now(),
+            slides: 0,
+            thumbnail: None,
+            manifest: None,
+            warning: None,
+        };
+        self.navigate(Page::Result, cx);
+        self.open_reader_version(course, cx);
+        let weak = cx.entity().downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            for _ in 0..300 {
+                let ready = weak
+                    .update(cx, |this, _| {
+                        !this.reading
+                            && this
+                                .preview
+                                .as_ref()
+                                .is_some_and(|preview| preview.course.dir == version)
+                    })
+                    .unwrap_or(false);
+                if ready {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(50))
+                    .await;
+            }
+            let settings = course2md::llm::LlmSettings {
+                base_url: endpoint,
+                model,
+                api_key: "test".into(),
+                ..course2md::llm::LlmSettings::default()
+            };
+            let _ = weak.update(cx, |this, cx| {
+                this.run_ai_translate(settings, "zh-Hans".into(), Some(result), cx);
+            });
+        })
+        .detach();
+    }
+
+    fn start_ai_translate(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+        if self.reader_ui.ai_edit.busy() {
+            return;
+        }
+        let target = target.unwrap_or_else(|| self.ai_edit_target());
+        // AI 编辑不依赖生成默认项（校对/摘要/翻译开关），只要求有默认 AI 服务。
+        let refs = self.preferences.default_refs();
+        if refs.llm.is_none() {
+            let text = course2md::tr!("先在 设置 → 服务 里添加 AI 服务并设为默认");
+            self.reader_ui.ai_edit.status = Some(text.into());
+            self.message = Some(text.to_owned());
+            cx.notify();
+            return;
+        }
+        let mut base = course2md::settings::ConfigFile::default();
+        base.llm.enabled = true;
+        let config = match self.preferences.config_for_refs(&base, &refs) {
+            Ok(config) => config,
+            Err(error) => {
+                self.reader_ui.ai_edit.status = Some(format!("{error:#}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let needed = match self.preferences.credential_references_for(&base, &refs) {
+            Ok(needed) => needed,
+            Err(error) => {
+                self.reader_ui.ai_edit.status = Some(format!("{error:#}").into());
+                cx.notify();
+                return;
+            }
+        };
+        let vault = self.preferences.vault();
+        let mut settings = config.llm.clone();
+        for reference in needed {
+            if let Ok(secret) = vault.resolve(&reference) {
+                settings.api_key = secret.expose().to_owned();
+            }
+        }
+        self.run_ai_translate(settings, target, None, cx);
+    }
+
+    /// 确认预览：按模式选取结果并原地写回这一段的原文/译文。
+    fn apply_ai_preview(&mut self, cx: &mut Context<Self>) {
+        if self.reader_ui.ai_edit.busy() || self.reading {
+            return;
+        }
+        let Some(preview) = self.reader_ui.ai_edit.preview.clone() else {
+            return;
+        };
+        let Some(current) = self.preview.as_ref() else {
+            return;
+        };
+        if self.page != Page::Result || !preview.matches_reader(self.read_generation, current) {
+            self.reader_ui.ai_edit.status =
+                Some(course2md::tr!("笔记内容已变化，请重新打开后再试").into());
+            cx.notify();
+            return;
+        }
+        let course = current.course.clone();
+        let version = preview.request.version.clone();
+        let request = self
+            .reader_ui
+            .ai_edit
+            .begin(version.clone(), self.read_generation);
+        self.reader_ui.ai_edit.status = Some(course2md::tr!("正在保存…").into());
+        self.tick_ai_edit_progress(cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let cancelled = request.cancelled.clone();
+            let result = crate::spawn_blocking_io(move || preview.save(&cancelled))
+                .recv()
+                .await
+                .unwrap_or_else(|_| Err(anyhow::anyhow!(course2md::tr!("写回时意外中断，请重试"))));
+            let _ = this.update(cx, |this, cx| {
+                if !this.finish_ai_request(&request) {
+                    return;
+                }
+                this.reader_ui.ai_edit.saved_preview(&result);
+                match result {
+                    Ok(()) => {
+                        this.reader_ui.ai_edit.status = Some(course2md::tr!("已更新本段").into());
+                        this.load_reader_version(course, true, cx);
+                    }
+                    Err(error) => {
+                        this.reader_ui.ai_edit.status = Some(format!("{error:#}").into());
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn discard_ai_preview(&mut self, cx: &mut Context<Self>) {
+        if self.reader_ui.ai_edit.busy() {
+            return;
+        }
+        self.reader_ui.ai_edit.preview = None;
+        self.reader_ui.ai_edit.status = Some(course2md::tr!("已放弃这次 AI 结果").into());
+        cx.notify();
+    }
+
+    /// 取消正在进行的 AI 编辑：结果返回后丢弃，不写回笔记。
+    fn cancel_ai_edit(&mut self, cx: &mut Context<Self>) {
+        if !self.reader_ui.ai_edit.busy() {
+            return;
+        }
+        self.reader_ui.ai_edit.cancel();
+        self.reader_ui.ai_edit.status = Some(course2md::tr!("正在取消…").into());
+        cx.notify();
+    }
+
+    fn finish_ai_request(&mut self, request: &AiEditRequest) -> bool {
+        self.reader_ui.ai_edit.finish(
+            request,
+            self.read_generation,
+            self.preview
+                .as_ref()
+                .filter(|_| self.page == Page::Result)
+                .map(|preview| preview.course.dir.as_path()),
+        )
+    }
+
+    /// 把本段对应的笔记截图（幻灯片/视频帧）一起发给模型，帮助理解上下文。
+    fn start_ai_region_with_image(
+        &mut self,
+        section: usize,
+        speech: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(preview) = self.preview.clone() else {
+            return;
+        };
+        let image = preview
+            .document
+            .sections
+            .get(section)
+            .map(|section| section.image.clone())
+            .unwrap_or_default();
+        let path = if image.is_empty() {
+            None
+        } else {
+            course2md::artifact::safe_asset_path(&preview.course.dir, &image).ok()
+        };
+        let images = match path {
+            Some(path) if path.is_file() => vec![path],
+            _ => {
+                self.message =
+                    Some(course2md::tr!("本段没有可用的笔记截图，改为只读文字").to_owned());
+                Vec::new()
+            }
+        };
+        self.start_ai_region(section, speech, AiRegionMode::Polish, images, cx);
+    }
+
+    fn start_ai_region(
+        &mut self,
+        section: usize,
+        speech: usize,
+        mode: AiRegionMode,
+        images: Vec<std::path::PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reader_ui.ai_edit.busy() || self.reading {
+            return;
+        }
+        let Some(preview) = self.preview.clone() else {
+            return;
+        };
+        let Some(text) = preview
+            .document
+            .sections
+            .get(section)
+            .and_then(|section| section.speech.get(speech))
+            .map(|event| event.text.clone())
+        else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let refs = self.preferences.default_refs();
+        if refs.llm.is_none() {
+            self.message =
+                Some(course2md::tr!("先在 设置 → 服务 里添加 AI 服务并设为默认").to_owned());
+            cx.notify();
+            return;
+        }
+        let mut base = course2md::settings::ConfigFile::default();
+        base.llm.enabled = true;
+        let config = match self.preferences.config_for_refs(&base, &refs) {
+            Ok(config) => config,
+            Err(error) => {
+                self.message = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        let needed = match self.preferences.credential_references_for(&base, &refs) {
+            Ok(needed) => needed,
+            Err(error) => {
+                self.message = Some(format!("{error:#}"));
+                cx.notify();
+                return;
+            }
+        };
+        let settings = config.llm.clone();
+        let target = matches!(mode, AiRegionMode::Translate).then(|| self.ai_edit_target());
+        let instruction = match mode {
+            AiRegionMode::Clean => {
+                course2md::tr!("删除语气词、重复和口误，保留有用信息，不新增事实。")
+            }
+            AiRegionMode::Polish => course2md::tr!("润色文字，保持原意与术语，不新增事实。"),
+            AiRegionMode::Translate => course2md::tr!("把原文翻译为目标语言，不改写原文。"),
+        };
+        let vault = self.preferences.vault();
+        let version = preview.course.dir.clone();
+        let document = preview.document.clone();
+        let request = self
+            .reader_ui
+            .ai_edit
+            .begin(version.clone(), self.read_generation);
+        self.reader_ui.ai_edit.preview = None;
+        self.reader_ui.ai_edit.status = Some(course2md::tr!("正在处理本段…").into());
+        self.tick_ai_edit_progress(cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let original = text.clone();
+            let cancelled = request.cancelled.clone();
+            let result = crate::spawn_blocking_io(move || {
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                let revision = course2md::note_edit::document_revision_for(&version, &document)?;
+                let mut settings = settings;
+                for reference in needed {
+                    settings.api_key = vault.resolve(&reference)?.expose().to_owned();
+                }
+                let control = course2md::dispatch::TaskControl::with_cancel_flag(cancelled.clone());
+                let edits = course2md::llm::enhance_regions_in_task(
+                    &settings,
+                    &[(0usize, text)],
+                    Some(instruction),
+                    target.as_deref(),
+                    &images,
+                    &control,
+                )?;
+                let edit = edits.into_iter().next().ok_or_else(|| {
+                    anyhow::anyhow!(course2md::tr!("服务没有返回这一段的编辑结果"))
+                })?;
+                if cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(None);
+                }
+                Ok(Some((revision, edit)))
+            })
+            .recv()
+            .await
+            .unwrap_or_else(|_| {
+                Err(anyhow::anyhow!(course2md::tr!(
+                    "处理本段时意外中断，请重试"
+                )))
+            });
+            let _ = this.update(cx, |this, cx| {
+                if !this.finish_ai_request(&request) {
+                    return;
+                }
+                let result = result.map(|result| {
+                    result.map(|(document_revision, edit)| AiPreview {
+                        request: request.clone(),
+                        document_revision,
+                        section,
+                        speech,
+                        mode,
+                        original,
+                        edit,
+                    })
+                });
+                this.reader_ui.ai_edit.generated_preview(&request, result);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn start_ai_undo(&mut self, cx: &mut Context<Self>) {
+        if self.reader_ui.ai_edit.busy() || self.reading {
+            return;
+        }
+        let Some(preview) = self.preview.clone() else {
+            return;
+        };
+        let version = preview.course.dir.clone();
+        let course = preview.course.clone();
+        let document = preview.document.clone();
+        let request = self
+            .reader_ui
+            .ai_edit
+            .begin(version.clone(), self.read_generation);
+        self.reader_ui.ai_edit.preview = None;
+        self.reader_ui.ai_edit.status = Some(course2md::tr!("正在保存…").into());
+        self.tick_ai_edit_progress(cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let cancelled = request.cancelled.clone();
+            let result = crate::spawn_blocking_io(move || {
+                let revision = course2md::note_edit::document_revision_for(&version, &document)?;
+                course2md::note_edit::undo_in_place_checked(&version, &revision, &cancelled)
+            })
+            .recv()
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!(course2md::tr!("撤销时意外中断，请重试"))));
+            let _ = this.update(cx, |this, cx| {
+                if !this.finish_ai_request(&request) {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.reader_ui.ai_edit.status =
+                            Some(course2md::tr!("已撤销这次 AI 翻译").into());
+                        this.load_reader_version(course, true, cx);
+                    }
+                    Err(error) => {
+                        this.reader_ui.ai_edit.status = Some(format!("{error:#}").into());
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn open_reader_version(&mut self, course: impl Into<Rc<Course>>, cx: &mut Context<Self>) {
         self.load_reader_version(Rc::unwrap_or_clone(course.into()), false, cx);
     }
-    fn load_reader_version(&mut self, course: Course, refresh: bool, cx: &mut Context<Self>) {
+    fn load_reader_version(&mut self, mut course: Course, refresh: bool, cx: &mut Context<Self>) {
         if self.reading
             || (!refresh
                 && self
@@ -2995,6 +3819,16 @@ impl Desktop {
                     .is_some_and(|preview| preview.course.dir == course.dir))
         {
             return;
+        }
+        // Invalidate at navigation start, before an old worker can finish.
+        if self.reader_ui.ai_edit.busy() || !refresh {
+            self.reader_ui.ai_edit.reset();
+        } else {
+            self.reader_ui.ai_edit.preview = None;
+        }
+        if refresh {
+            // The cached manifest predates the committed edit and its new revision.
+            course.manifest = None;
         }
         self.save_reading_position(cx);
         let position = self.capture_reading_position();
@@ -4578,6 +5412,10 @@ impl Desktop {
         } else {
             icon_button("reader-more", BUTTON_MEDIUM, false, cx)
         };
+        let can_ai = self.preview.is_some();
+        let can_undo = preview.course.dir.join("document.json.before-ai").is_file();
+        let ai_busy = self.reader_ui.ai_edit.busy();
+        let ai_target = self.ai_edit_target();
         more.when(short_reader, |button| {
             button.track_focus(&self.reader_ui.menu_focus)
         })
@@ -4607,6 +5445,8 @@ impl Desktop {
         })
         .dropdown_menu(move |menu, window, cx| {
             let details = more_weak.clone();
+            let ai = more_weak.clone();
+            let undo = more_weak.clone();
             let player = more_weak.clone();
             let source = more_weak.clone();
             let files = more_weak.clone();
@@ -4661,6 +5501,69 @@ impl Desktop {
                             }),
                     )
                     .separator();
+            }
+            if can_ai || can_undo {
+                if can_ai {
+                    if ai_busy {
+                        let cancel = more_weak.clone();
+                        menu = menu
+                            .item(
+                                PopupMenuItem::new(course2md::tr!("正在翻译整篇笔记…"))
+                                    .icon(icons::text_lines())
+                                    .disabled(true),
+                            )
+                            .item(
+                                PopupMenuItem::new(course2md::tr!("取消 AI 编辑"))
+                                    .icon(icons::refresh())
+                                    .on_click(move |_, _, cx| {
+                                        let _ = cancel.update(cx, |this, cx| {
+                                            this.cancel_ai_edit(cx);
+                                        });
+                                    }),
+                            );
+                    } else {
+                        let target_now = ai_target.clone();
+                        menu = menu.submenu_with_icon(
+                            Some(icons::text_lines()),
+                            course2md::tr!("AI 翻译整篇"),
+                            window,
+                            cx,
+                            move |menu, _, _| {
+                                course2md::language::TARGETS
+                                    .iter()
+                                    .fold(menu, |menu, (code, _)| {
+                                        let code = *code;
+                                        let weak = ai.clone();
+                                        let checked = code == target_now.as_str();
+                                        menu.item(
+                                            PopupMenuItem::new(course2md::language::native_name(
+                                                code,
+                                            ))
+                                            .checked(checked)
+                                            .on_click(move |_, _, cx| {
+                                                let _ = weak.update(cx, |this, cx| {
+                                                    this.start_ai_translate(
+                                                        Some(code.to_owned()),
+                                                        cx,
+                                                    );
+                                                });
+                                            }),
+                                        )
+                                    })
+                            },
+                        );
+                    }
+                }
+                if can_undo {
+                    menu = menu.item(
+                        PopupMenuItem::new(course2md::tr!("撤销这次 AI 翻译"))
+                            .icon(icons::refresh())
+                            .on_click(move |_, _, cx| {
+                                let _ = undo.update(cx, |this, cx| this.start_ai_undo(cx));
+                            }),
+                    );
+                }
+                menu = menu.separator();
             }
             menu = menu
                 .item(
@@ -4893,6 +5796,141 @@ impl Desktop {
             }
         };
         let mut notices = Vec::new();
+        // 进行中/完成状态始终在正文顶部可见：带耗时与取消/关闭。
+        if let Some(status) = self.reader_ui.ai_edit.status.clone() {
+            let busy = self.reader_ui.ai_edit.busy();
+            let elapsed = self
+                .reader_ui
+                .ai_edit
+                .started
+                .map(|started| started.elapsed().as_secs())
+                .unwrap_or(0);
+            let text = if busy {
+                course2md::tr!("{} · {} 秒", status, elapsed)
+            } else {
+                status.to_string()
+            };
+            let action: AnyElement = if busy {
+                outline_pill("ai-edit-cancel", cx)
+                    .icon(icons::refresh())
+                    .label(course2md::tr!("取消 AI 编辑"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cancel_ai_edit(cx);
+                    }))
+                    .into_any_element()
+            } else {
+                outline_pill("ai-edit-dismiss", cx)
+                    .icon(icons::check())
+                    .label(course2md::tr!("知道了"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reader_ui.ai_edit.status = None;
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            };
+            notices.push(crate::motion::enter(
+                "reader-ai-edit-progress",
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .px(rems(20. / 14.))
+                    .py(rems(1.))
+                    .bg(color(SURFACE))
+                    .rounded(rems(20. / 14.))
+                    .child(badge(if busy {
+                        BadgeKind::Progress
+                    } else {
+                        BadgeKind::Tonal
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(theme::accessible_text("ai-edit-progress", text)),
+                    )
+                    .child(action),
+            ));
+        }
+        // 段落 AI 结果先预览再写回：原文、结果与保留片段都摆在确认按钮旁。
+        let ai_preview = self.reader_ui.ai_edit.preview.as_ref().map(|draft| {
+            let mode = match draft.mode {
+                AiRegionMode::Clean => course2md::tr!("清理语气词").to_owned(),
+                AiRegionMode::Polish => course2md::tr!("优化").to_owned(),
+                AiRegionMode::Translate => course2md::tr!("翻译").to_owned(),
+            };
+            let result = match draft.mode {
+                AiRegionMode::Clean => draft.edit.cleaned.clone(),
+                AiRegionMode::Polish => draft.edit.polished.clone(),
+                AiRegionMode::Translate => draft.edit.translation.clone().unwrap_or_default(),
+            };
+            let keep = draft
+                .edit
+                .keep
+                .iter()
+                .filter_map(|(start, end)| draft.original.get(*start..*end))
+                .collect::<Vec<_>>()
+                .join(" / ");
+            (mode, draft.original.clone(), result, keep)
+        });
+        if let Some((mode, original, result, keep)) = ai_preview {
+            let mut card = v_flex()
+                .gap_3()
+                .px(rems(20. / 14.))
+                .py(rems(16. / 14.))
+                .bg(color(SURFACE))
+                .rounded(rems(20. / 14.))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(badge(BadgeKind::Tonal))
+                        .child(
+                            theme::accessible_text(
+                                "ai-preview-title",
+                                course2md::tr!("AI 预览 · {}", mode),
+                            )
+                            .text_sm(),
+                        ),
+                )
+                .child(theme::accessible_text(
+                    "ai-preview-original",
+                    course2md::tr!("原文：{}", original),
+                ))
+                .child(theme::accessible_text(
+                    "ai-preview-result",
+                    course2md::tr!("结果：{}", result),
+                ));
+            if !keep.is_empty() {
+                card = card.child(theme::accessible_text(
+                    "ai-preview-keep",
+                    course2md::tr!("保留片段：{}", keep),
+                ));
+            }
+            card = card.child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .child(
+                        outline_pill("ai-preview-apply", cx)
+                            .icon(icons::check())
+                            .label(course2md::tr!("应用"))
+                            .disabled(self.reader_ui.ai_edit.busy())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.apply_ai_preview(cx);
+                            })),
+                    )
+                    .child(
+                        outline_pill("ai-preview-discard", cx)
+                            .icon(icons::refresh())
+                            .label(course2md::tr!("丢弃"))
+                            .disabled(self.reader_ui.ai_edit.busy())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discard_ai_preview(cx);
+                            })),
+                    ),
+            );
+            notices.push(crate::motion::enter("reader-ai-preview", card));
+        }
         if let Some(current) = &preview.course.manifest
             && let Some(newer) = self
                 .library_view_cache
@@ -5829,6 +6867,7 @@ impl Desktop {
     }
     /// Leaving the reader releases its decoded screenshots.
     pub(crate) fn release_reader_images(&mut self, cx: &mut Context<Self>) {
+        self.reader_ui.ai_edit.reset();
         self.reader_ui.images.clear(cx);
     }
     /// Where the reader keeps its decoded screenshots.
@@ -6603,7 +7642,10 @@ fn load_reader_data(preview: &notes::Preview) -> ReaderData {
                         if !path.is_dir() || !path.join("manifest.json").is_file() {
                             continue;
                         }
-                        match course2md::artifact::read_manifest(&path.join("manifest.json")) {
+                        match (|| {
+                            let _guard = course2md::note_edit::read_guard(&path)?;
+                            course2md::artifact::read_manifest(&path.join("manifest.json"))
+                        })() {
                             Ok(other) if other.course_id == manifest.course_id => {
                                 let mut course = preview.course.clone();
                                 course.dir = path;
@@ -6722,6 +7764,272 @@ fn bounded_scroll_panel(
             .child(body.flex_shrink(1.).min_h_0())
             .child(scrollbar),
     )
+}
+
+#[cfg(test)]
+mod ai_edit_tests {
+    use super::{AiEditRequest, AiEditState, AiPreview, AiRegionMode};
+    use crate::notes;
+    use gpui::{AppContext, TestAppContext};
+    use std::{
+        cell::Cell,
+        path::PathBuf,
+        rc::Rc,
+        sync::{Arc, atomic::AtomicBool},
+    };
+
+    fn note() -> (tempfile::TempDir, notes::Preview) {
+        let temp = tempfile::tempdir().unwrap();
+        let course = notes::fixtures::published_note(temp.path(), 1, &[0.], Default::default());
+        let preview = notes::read_preview(course).unwrap();
+        (temp, preview)
+    }
+
+    fn draft(preview: &notes::Preview, request: AiEditRequest) -> AiPreview {
+        AiPreview {
+            request,
+            document_revision: course2md::note_edit::document_revision_for(
+                &preview.course.dir,
+                &preview.document,
+            )
+            .unwrap(),
+            section: 0,
+            speech: 0,
+            mode: AiRegionMode::Polish,
+            original: preview.document.sections[0].speech[0].text.clone(),
+            edit: course2md::llm::RegionEdit {
+                id: 0,
+                keep: Vec::new(),
+                cleaned: "cleaned".into(),
+                polished: "reviewed edit".into(),
+                translation: Some("translation".into()),
+            },
+        }
+    }
+
+    #[gpui::test]
+    fn late_ai_callback_cannot_reopen_a_note_or_clear_a_new_request(cx: &mut TestAppContext) {
+        let state = cx.new(|_| AiEditState::default());
+        let a = PathBuf::from("/notes/a");
+        let b = PathBuf::from("/notes/b");
+        let old = state.update(cx, |state, _| state.begin(a.clone(), 1));
+        let (send, receive) = smol::channel::bounded::<()>(1);
+        let reloaded = Rc::new(Cell::new(false));
+        let callback_reload = reloaded.clone();
+        let callback_state = state.clone();
+        let callback_request = old.clone();
+        let callback_version = a.clone();
+        cx.spawn(async move |mut cx| {
+            receive.recv().await.unwrap();
+            callback_state.update(&mut cx, |state, _| {
+                // We returned to A, but it is a different reading session.
+                callback_reload.set(state.finish(&callback_request, 3, Some(&callback_version)));
+            });
+        })
+        .detach();
+        cx.run_until_parked();
+        state.update(cx, |state, _| {
+            state.reset();
+            let other = state.begin(b, 2);
+            state.reset();
+            assert!(other.is_cancelled());
+        });
+        let current = state.update(cx, |state, _| state.begin(a, 3));
+        send.try_send(()).unwrap();
+        cx.run_until_parked();
+        state.update(cx, |state, _| {
+            assert!(old.is_cancelled());
+            assert!(state.owns(&current));
+            assert!(state.busy());
+            assert!(!current.is_cancelled());
+        });
+        assert!(!reloaded.get());
+    }
+
+    #[gpui::test]
+    fn cancellation_after_worker_reply_discards_the_queued_preview(cx: &mut TestAppContext) {
+        let (_temp, preview) = note();
+        let state = cx.new(|_| AiEditState::default());
+        let version = preview.course.dir.clone();
+        let request = state.update(cx, |state, _| state.begin(version.clone(), 1));
+        let result = draft(&preview, request.clone());
+        let callback_state = state.clone();
+        cx.spawn(async move |mut cx| {
+            callback_state.update(&mut cx, |state, _| {
+                if state.finish(&request, 1, Some(&version)) {
+                    state.generated_preview(&request, Ok(Some(result)));
+                }
+            });
+        })
+        .detach();
+        state.update(cx, |state, _| state.cancel());
+        cx.run_until_parked();
+        state.update(cx, |state, _| {
+            assert!(!state.busy());
+            assert!(state.preview.is_none());
+            assert_eq!(
+                state.status.as_deref(),
+                Some(course2md::tr!("已取消 AI 编辑"))
+            );
+        });
+    }
+
+    #[test]
+    fn switching_reader_cancels_work_and_removes_its_preview_and_status() {
+        let (_temp, preview) = note();
+        let mut state = AiEditState::default();
+        let request = state.begin(preview.course.dir.clone(), 1);
+        state.preview = Some(draft(&preview, request.clone()));
+        state.status = Some("saving".into());
+        state.reset();
+        assert!(request.is_cancelled());
+        assert!(state.preview.is_none());
+        assert!(state.status.is_none());
+        assert!(state.started.is_none());
+        assert!(!state.finish(&request, 2, Some(&preview.course.dir)));
+    }
+
+    #[test]
+    fn failed_ai_save_preserves_the_exact_preview_for_retry() {
+        let (_temp, preview) = note();
+        let version = &preview.course.dir;
+        let mut state = AiEditState::default();
+        let generated = state.begin(version.clone(), 1);
+        let result = draft(&preview, generated.clone());
+        assert!(state.finish(&generated, 1, Some(version)));
+        state.generated_preview(&generated, Ok(Some(result)));
+        let original = std::fs::read(version.join("document.json")).unwrap();
+        let manifest = std::fs::read(version.join("manifest.json")).unwrap();
+        // A real filesystem obstruction, independent of permissions or root privileges.
+        std::fs::rename(version.join("course.md"), version.join("course.md.saved")).unwrap();
+        std::fs::create_dir(version.join("course.md")).unwrap();
+        let save = state.begin(version.clone(), 1);
+        let failed = state.preview.as_ref().unwrap().save(&save.cancelled);
+        assert!(failed.is_err());
+        assert!(state.finish(&save, 1, Some(version)));
+        state.saved_preview(&failed);
+        assert_eq!(
+            state.preview.as_ref().unwrap().edit.polished,
+            "reviewed edit"
+        );
+        assert_eq!(
+            std::fs::read(version.join("document.json")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(version.join("manifest.json")).unwrap(),
+            manifest
+        );
+
+        std::fs::remove_dir(version.join("course.md")).unwrap();
+        std::fs::rename(version.join("course.md.saved"), version.join("course.md")).unwrap();
+        let retry = state.begin(version.clone(), 1);
+        let saved = state.preview.as_ref().unwrap().save(&retry.cancelled);
+        assert!(saved.is_ok(), "{saved:?}");
+        assert!(state.finish(&retry, 1, Some(version)));
+        state.saved_preview(&saved);
+        assert!(state.preview.is_none());
+        let document: course2md::artifact::Document =
+            serde_json::from_slice(&std::fs::read(version.join("document.json")).unwrap()).unwrap();
+        assert_eq!(document.sections[0].speech[0].text, "reviewed edit");
+    }
+
+    #[test]
+    fn ai_preview_rejects_other_notes_changed_originals_and_stale_disk_revisions() {
+        let (_temp, mut preview) = note();
+        let (_other_temp, other) = note();
+        let mut state = AiEditState::default();
+        let request = state.begin(preview.course.dir.clone(), 1);
+        let draft = draft(&preview, request);
+        assert!(draft.matches_reader(1, &preview));
+        assert!(!draft.matches_reader(2, &preview));
+        assert!(!draft.matches_reader(1, &other));
+        preview.document.sections[0].speech[0].text = "changed in reader".into();
+        assert!(!draft.matches_reader(1, &preview));
+        preview.document.sections[0].speech[0].text = draft.original.clone();
+        course2md::note_edit::apply_region_edit(&preview.course.dir, 0, 0, "concurrent edit", None)
+            .unwrap();
+        let concurrent = std::fs::read(preview.course.dir.join("document.json")).unwrap();
+        assert!(
+            course2md::note_edit::document_revision_for(&preview.course.dir, &preview.document,)
+                .is_err()
+        );
+        assert!(draft.save(&Arc::new(AtomicBool::new(false))).is_err());
+        assert_eq!(
+            std::fs::read(preview.course.dir.join("document.json")).unwrap(),
+            concurrent
+        );
+    }
+
+    #[test]
+    fn cancelled_preview_save_leaves_the_note_unchanged() {
+        let (_temp, preview) = note();
+        let mut state = AiEditState::default();
+        let request = state.begin(preview.course.dir.clone(), 1);
+        let draft = draft(&preview, request.clone());
+        let original = std::fs::read(preview.course.dir.join("document.json")).unwrap();
+        state.cancel();
+        assert!(draft.save(&request.cancelled).is_err());
+        assert_eq!(
+            std::fs::read(preview.course.dir.join("document.json")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn translation_reports_counts_and_reason_without_refreshing_all_failed_results() {
+        let mut state = AiEditState::default();
+        let mut report = course2md::note_edit::EditReport {
+            attempted: 4,
+            succeeded: 2,
+            failed: 2,
+            note: Some("HTTP 429: quota exhausted".into()),
+        };
+        assert!(state.translated(&Ok(report)));
+        assert_eq!(
+            state.status.as_deref(),
+            Some(
+                format!(
+                    "{}\nHTTP 429: quota exhausted",
+                    course2md::tr!("翻译未全部完成（{}/{} 失败）", 2, 4),
+                )
+                .as_str()
+            )
+        );
+
+        report = course2md::note_edit::EditReport {
+            attempted: 4,
+            succeeded: 0,
+            failed: 4,
+            note: Some("HTTP 503: unavailable".into()),
+        };
+        assert!(!state.translated(&Ok(report)));
+        assert_eq!(
+            state.status.as_deref(),
+            Some(
+                format!(
+                    "{}\nHTTP 503: unavailable",
+                    course2md::tr!("翻译未全部完成（{}/{} 失败）", 4, 4),
+                )
+                .as_str()
+            )
+        );
+
+        report = course2md::note_edit::EditReport {
+            attempted: 4,
+            succeeded: 4,
+            failed: 0,
+            note: None,
+        };
+        assert!(state.translated(&Ok(report)));
+        assert_eq!(
+            state.status.as_deref(),
+            Some(course2md::tr!("已翻译 {}/{} 段", 4, 4).as_str())
+        );
+
+        assert!(!state.translated(&Err(anyhow::anyhow!("connection closed"))));
+        assert_eq!(state.status.as_deref(), Some("connection closed"));
+    }
 }
 
 #[cfg(test)]
@@ -6956,6 +8264,7 @@ mod tests {
         let task = workspace::TaskRecord {
             id: manifest.task_id.clone(),
             plan: workspace::TaskPlan {
+                slides: Vec::new(),
                 operation: Default::default(),
                 source: source::Source {
                     input: "https://www.bilibili.com/video/BVfixture?p=2".into(),

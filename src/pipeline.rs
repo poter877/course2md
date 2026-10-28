@@ -311,7 +311,8 @@ async fn reprocess(
     job.control.check()?;
     let base_dir_owned = base_dir.to_path_buf();
     let base_control = job.control.clone();
-    let base = blocking(move || {
+    let (base, mut document, base_guard) = blocking(move || {
+        let guard = crate::note_edit::read_guard(&base_dir_owned)?;
         let base = artifact::read_manifest(&base_dir_owned.join("manifest.json"))?;
         // Reprocessing consumes the internal document, timeline and image assets.
         // A manually edited presentation file must stay intact, and does not make
@@ -323,7 +324,10 @@ async fn reprocess(
                 || base.frames.iter().any(|frame| frame.image == asset.path)
         });
         artifact::validate_version_in_task(&base_dir_owned, &inputs, &base_control)?;
-        Ok(base)
+        let document: artifact::Document = serde_json::from_slice(&std::fs::read(
+            artifact::safe_asset_path(&base_dir_owned, &base.document)?,
+        )?)?;
+        Ok((base, document, guard))
     })
     .await?;
     if let Some(markdown) = base.assets.iter().find(|asset| asset.path == base.markdown) {
@@ -342,8 +346,6 @@ async fn reprocess(
     );
     use execution::Component;
     let has = |component: Component| components.contains(&component);
-    let mut document: artifact::Document =
-        serde_json::from_slice(&std::fs::read(base_dir.join(&base.document))?)?;
     if components
         .iter()
         .all(|&component| component == Component::Exports)
@@ -394,6 +396,8 @@ async fn reprocess(
         })
         .await?;
     }
+    // All base inputs are now copied; release the snapshot before remote work.
+    drop(base_guard);
     for section in &mut document.sections {
         if !section.image.is_empty() {
             section.image = format!("base/{}", section.image);

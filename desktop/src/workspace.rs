@@ -1056,7 +1056,10 @@ impl State {
             .artifact
             .clone()
             .context(course2md::tr!("此任务尚无可补做的笔记正文"))?;
-        let manifest = course2md::artifact::read_manifest(&base.join("manifest.json"))?;
+        let manifest = {
+            let _read_guard = course2md::note_edit::read_guard(&base)?;
+            course2md::artifact::read_manifest(&base.join("manifest.json"))?
+        };
         ensure!(
             manifest.source_id == original.plan.source_id,
             course2md::tr!("笔记来源与任务不匹配")
@@ -1581,6 +1584,7 @@ fn probe_artifact(task: &TaskRecord, location: &LibraryLocation) -> Result<Artif
     let course = course_dir_name(&task.plan.source_id);
     let version = location.root.join(&course).join("versions").join(&task.id);
     if version.join("manifest.json").is_file() {
+        let _read_guard = course2md::note_edit::read_guard(&version)?;
         let manifest = course2md::artifact::read_manifest(&version.join("manifest.json"))?;
         ensure!(
             manifest.task_id == task.id && manifest.source_id == task.plan.source_id,

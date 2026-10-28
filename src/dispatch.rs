@@ -11,7 +11,10 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 /// Durable receipts describe a service snapshot without a stored configuration.
@@ -308,9 +311,25 @@ pub struct ControlSource {
 /// The default handle has no task context: checks always pass, and each
 /// request is classified through its own in-memory ledger.
 #[derive(Clone, Default)]
-pub struct TaskControl(Option<Arc<Ledger>>);
+pub struct TaskControl(Option<Arc<Ledger>>, Option<Arc<AtomicBool>>);
 
 impl TaskControl {
+    /// In-process operations use the same cancellation boundaries as task workers,
+    /// without manufacturing a control file or losing the flag when cloned.
+    pub fn with_cancel_flag(cancelled: Arc<AtomicBool>) -> Self {
+        Self(None, Some(cancelled))
+    }
+
+    fn check_cancel_flag(&self) -> std::result::Result<(), Failure> {
+        if self
+            .1
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(Failure::local(crate::tr!("已取消 AI 编辑")));
+        }
+        Ok(())
+    }
     /// The control of a task whose receipts live in `work_dir/requests`.
     pub fn open(work_dir: &Path, source: ControlSource) -> Result<Self> {
         let mut ledger = Ledger::new(
@@ -319,11 +338,12 @@ impl TaskControl {
             &source.service_versions,
         )?;
         ledger.parent = source.parent;
-        Ok(Self(Some(Arc::new(ledger))))
+        Ok(Self(Some(Arc::new(ledger)), None))
     }
 
     /// Safe boundaries for local work. Unknown cloud receipts do not prevent saving local work.
     pub fn check(&self) -> Result<()> {
+        self.check_cancel_flag()?;
         if let Some(ledger) = &self.0 {
             ledger.check_intent(None).map_err(anyhow::Error::new)?;
         }
@@ -350,6 +370,7 @@ impl TaskControl {
         send: impl FnOnce() -> std::result::Result<HttpResponse, NetworkFailure>,
         validate: impl FnOnce(&Value) -> Result<()>,
     ) -> std::result::Result<Reply, Failure> {
+        self.check_cancel_flag()?;
         match &self.0 {
             Some(ledger) => ledger.send_described(spec, send, validate),
             // Outside a task there is no durable context, so one in-memory ledger per
@@ -844,6 +865,30 @@ pub fn receive(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn in_process_cancellation_stops_clones_before_sending_requests() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let control = TaskControl::with_cancel_flag(cancelled.clone());
+        let clone = control.clone();
+        assert!(clone.check().is_ok());
+        cancelled.store(true, Ordering::Relaxed);
+        assert!(clone.check().is_err());
+        let identity = serde_json::json!({"text": "never send"});
+        let result = clone.request(
+            &RequestSpec {
+                service: "llm",
+                purpose: "translation",
+                description: "cancelled edit",
+                endpoint: "http://127.0.0.1:1",
+                identity: &identity,
+                resend: Resend::AskUser,
+            },
+            || panic!("a cancelled operation must not send a request"),
+            |_| panic!("a cancelled operation must not validate a response"),
+        );
+        assert!(result.is_err());
+    }
 
     #[test]
     fn response_format_fallback_requires_explicit_provider_evidence() {

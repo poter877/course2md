@@ -1,3 +1,4 @@
+pub mod align;
 pub mod apple;
 pub mod artifact;
 pub mod asr;
@@ -29,6 +30,7 @@ pub mod render;
 pub mod runtime;
 pub mod scene;
 pub mod settings;
+pub mod slides;
 pub mod subtitle;
 pub mod summarize;
 #[cfg(test)]

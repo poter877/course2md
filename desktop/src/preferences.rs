@@ -140,6 +140,10 @@ pub struct GenerationPreferences {
     pub last_local_provider: Option<AsrProvider>,
     pub subtitle_languages_draft: Option<String>,
     pub preferred_subtitle_languages: Vec<String>,
+    /// Master switch: when false, no AI step runs at all (proofreading,
+    /// summary, image-assisted proofreading, translation) and per-task
+    /// options cannot turn AI back on.
+    pub ai_allowed: bool,
 }
 
 /// The stored form, which also reads files written before the AI choices were
@@ -155,6 +159,7 @@ struct StoredGeneration {
     last_local_provider: Option<AsrProvider>,
     subtitle_languages_draft: Option<String>,
     preferred_subtitle_languages: Option<Vec<String>>,
+    ai_allowed: Option<bool>,
     ai_proofread: Option<bool>,
     ai_summary: Option<bool>,
     translate: Option<String>,
@@ -181,6 +186,7 @@ impl From<StoredGeneration> for GenerationPreferences {
             last_local_provider: stored.last_local_provider,
             subtitle_languages_draft: stored.subtitle_languages_draft,
             preferred_subtitle_languages: stored.preferred_subtitle_languages.unwrap_or_default(),
+            ai_allowed: stored.ai_allowed.unwrap_or(true),
         }
     }
 }
@@ -203,6 +209,7 @@ impl Default for GenerationPreferences {
             last_local_provider: None,
             subtitle_languages_draft: None,
             preferred_subtitle_languages: Vec::new(),
+            ai_allowed: true,
         }
     }
 }
@@ -245,6 +252,12 @@ impl GenerationPreferences {
             disable_hint: true,
             ..self.ai.clone()
         };
+        if !self.ai_allowed {
+            config.llm.enabled = false;
+            config.llm.summarize = false;
+            config.llm.vision = false;
+            config.llm.translate = None;
+        }
         clear_service_fields(config);
     }
 }

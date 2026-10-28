@@ -2,7 +2,8 @@
 
 use crate::fetch::VideoMeta;
 use crate::timeline::Section;
-use std::fmt::Write as _;
+use anyhow::Result;
+use std::io::Write;
 use std::path::Path;
 
 /// mm:ss 或 h:mm:ss
@@ -14,6 +15,34 @@ pub fn fmt_ts(sec: f64) -> String {
     } else {
         format!("{m:02}:{s:02}")
     }
+}
+
+/// 从 `slides/d{deck}-{page:04}.jpg` 读回套数与页码。
+fn slide_label(image: &str) -> Option<(u32, u32)> {
+    let name = image.rsplit('/').next()?.strip_prefix('d')?;
+    let (deck, rest) = name.split_once('-')?;
+    let page = rest.strip_suffix(".jpg")?;
+    Some((deck.parse().ok()?, page.parse().ok()?))
+}
+
+/// 成图标题：PDF 页用页码，视频独有画面用固定标签。
+fn image_label(image: &str) -> Option<String> {
+    page_label(image).or_else(|| {
+        image
+            .starts_with("frames/")
+            .then(|| crate::tr!("视频画面（无对应幻灯片）").to_string())
+    })
+}
+
+/// 页标题：单套 PDF 用"第 N 页"，多套带套号。
+fn page_label(image: &str) -> Option<String> {
+    slide_label(image).map(|(deck, page)| {
+        if deck == 1 {
+            crate::tr!("第 {} 页", page)
+        } else {
+            crate::tr!("第 {} 套 · 第 {} 页", deck, page)
+        }
+    })
 }
 
 fn source_url(meta: &VideoMeta) -> String {
@@ -95,6 +124,24 @@ fn md_link_target(target: &str) -> String {
 }
 
 pub fn render_markdown(meta: &VideoMeta, sections: &[Section]) -> String {
+    let mut output = Vec::new();
+    write_markdown(meta, sections, None, &mut output, |out, path| {
+        out.write_all(path.as_bytes())?;
+        Ok(())
+    })
+    .expect("writing to a Vec cannot fail");
+    String::from_utf8(output).expect("renderer writes UTF-8")
+}
+
+/// Stream a note, resolving image destinations without changing their page labels.
+/// The callback writes the Markdown target only; it must be safe inside `(…)`.
+pub(crate) fn write_markdown<W: Write>(
+    meta: &VideoMeta,
+    sections: &[Section],
+    summary: Option<&crate::summarize::Summary>,
+    md: &mut W,
+    mut image_target: impl FnMut(&mut W, &str) -> Result<()>,
+) -> Result<()> {
     let title = md_inline(&meta.title);
     let uploader = if meta.uploader.is_empty() {
         String::new()
@@ -103,12 +150,10 @@ pub fn render_markdown(meta: &VideoMeta, sections: &[Section]) -> String {
     };
     // 本地来源的 canonicalize 每次渲染只算一次
     let source = source_url(meta);
-    let mut md = String::new();
-    // 写 String 不会失败，unwrap 安全
-    write!(md, "# {title}\n\n").unwrap();
-    md.push_str(&uploader);
+    write!(md, "# {title}\n\n")?;
+    md.write_all(uploader.as_bytes())?;
     if meta.duration > 0. {
-        writeln!(md, "- {}", crate::tr!("时长 {}", fmt_ts(meta.duration))).unwrap();
+        writeln!(md, "- {}", crate::tr!("时长 {}", fmt_ts(meta.duration)))?;
     }
     if !meta.webpage_url.is_empty() {
         writeln!(
@@ -117,8 +162,7 @@ pub fn render_markdown(meta: &VideoMeta, sections: &[Section]) -> String {
             crate::tr!("来源"),
             md_link_text(&meta.webpage_url),
             md_link_target(&source)
-        )
-        .unwrap();
+        )?;
     }
     writeln!(
         md,
@@ -129,43 +173,83 @@ pub fn render_markdown(meta: &VideoMeta, sections: &[Section]) -> String {
             sections.iter().filter(|s| !s.image.is_empty()).count(),
             sections.iter().map(|s| s.speech.len()).sum::<usize>()
         )
-    )
-    .unwrap();
-    md.push_str("---\n\n");
+    )?;
+    md.write_all(b"---\n\n")?;
+    if let Some(summary) = summary {
+        md.write_all(crate::summarize::render_md_block(summary).as_bytes())?;
+        writeln!(md)?;
+    }
     for s in sections {
-        if meta.webpage_url.is_empty() {
-            write!(md, "## {}\n\n", fmt_ts(s.t)).unwrap();
-        } else {
-            write!(
-                md,
-                "## [{}]({})\n\n",
-                fmt_ts(s.t),
-                md_link_target(&ts_url_from(&source, s.t))
-            )
-            .unwrap();
+        let page = image_label(&s.image);
+        match (page.as_deref(), meta.webpage_url.is_empty()) {
+            (Some(label), true) => {
+                writeln!(md, "## {label} · {}\n", fmt_ts(s.t))?;
+            }
+            (Some(label), false) => {
+                writeln!(
+                    md,
+                    "## {label} · [{}]({})\n",
+                    fmt_ts(s.t),
+                    md_link_target(&ts_url_from(&source, s.t))
+                )?;
+            }
+            (None, true) => {
+                writeln!(md, "## {}\n", fmt_ts(s.t))?;
+            }
+            (None, false) => {
+                writeln!(
+                    md,
+                    "## [{}]({})\n",
+                    fmt_ts(s.t),
+                    md_link_target(&ts_url_from(&source, s.t))
+                )?;
+            }
         }
         if !s.image.is_empty() {
-            write!(
-                md,
-                "![{}]({})\n\n",
-                crate::tr!("视频 {} 的截图", fmt_ts(s.t)),
-                s.image
-            )
-            .unwrap();
+            let alt = match page {
+                Some(label) => label,
+                None => crate::tr!("视频 {} 的截图", fmt_ts(s.t)),
+            };
+            write!(md, "![{alt}](")?;
+            image_target(md, &s.image)?;
+            writeln!(md, ")\n")?;
         }
         for ev in &s.speech {
-            write!(md, "{}\n\n", ev.text).unwrap();
+            write!(md, "{}\n\n", ev.text)?;
             // Bilingual notes quote the translation under its original.
             if let Some(translation) = &ev.translation {
-                write!(md, "> {}\n\n", md_inline(translation)).unwrap();
+                write!(md, "> {}\n\n", md_inline(translation))?;
             }
         }
     }
-    md
+    Ok(())
 }
 
 pub fn render_html(meta: &VideoMeta, sections: &[Section]) -> String {
-    let mut body = String::new();
+    let mut output = Vec::new();
+    write_html(meta, sections, None, &mut output, |out, path| {
+        out.write_all(esc(path).as_bytes())?;
+        Ok(())
+    })
+    .expect("writing to a Vec cannot fail");
+    String::from_utf8(output).expect("renderer writes UTF-8")
+}
+
+/// Stream HTML with the same layout as `render_html`. The callback writes an
+/// escaped attribute value (or a data URI) directly into each image's `src`.
+pub(crate) fn write_html<W: Write>(
+    meta: &VideoMeta,
+    sections: &[Section],
+    summary: Option<&crate::summarize::Summary>,
+    body: &mut W,
+    mut image_target: impl FnMut(&mut W, &str) -> Result<()>,
+) -> Result<()> {
+    write!(
+        body,
+        "<!DOCTYPE html>\n<html lang=\"zh\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{title}</title>\n<style>\n:root {{ color-scheme: light dark; }}\nbody {{ max-width: 920px; margin: 0 auto; padding: 1rem; font-family: system-ui, -apple-system, sans-serif; line-height: 1.7; }}\nheader h1 {{ font-size: 1.5rem; }}\nheader p {{ color: #888; }}\nsection {{ margin: 2rem 0; }}\nsection h2 {{ font-size: 1rem; font-weight: 600; }}\nsection h2 a {{ color: #0969da; text-decoration: none; }}\nimg {{ max-width: 100%; border: 1px solid #8884; border-radius: 6px; }}\np {{ margin: .4rem 0; }}\np.translation {{ color: #777; margin-top: 0; }}\n.math {{ display: inline-block; }}\n.math svg {{ display: block; }}\n.math.display {{ display: block; margin: .6rem auto; max-width: 100%; }}\n</style>\n</head>\n<body>\n",
+        title = esc(&meta.title),
+    )?;
+
     let mut details = Vec::new();
     // 本地来源的 canonicalize 每次渲染只算一次
     let source = source_url(meta);
@@ -192,43 +276,52 @@ pub fn render_html(meta: &VideoMeta, sections: &[Section]) -> String {
         "<header><h1>{}</h1><p>{}</p></header>",
         esc(&meta.title),
         details.join(" · ")
-    )
-    .unwrap();
+    )?;
+    if let Some(summary) = summary {
+        body.write_all(crate::summarize::render_html_block(summary).as_bytes())?;
+        writeln!(body)?;
+    }
     for s in sections {
-        write!(body, "<section id=\"t{}\"><h2>", s.t.floor() as u64).unwrap();
+        write!(body, "<section id=\"t{}\"><h2>", s.t.floor() as u64)?;
+        if let Some(label) = image_label(&s.image) {
+            write!(body, "{} · ", esc(&label))?;
+        }
         if meta.webpage_url.is_empty() {
-            write!(body, "{}", esc(&fmt_ts(s.t))).unwrap();
+            write!(body, "{}", esc(&fmt_ts(s.t)))?;
         } else {
             write!(
                 body,
                 "<a href=\"{}\" target=\"_blank\">{}</a>",
                 esc(&ts_url_from(&source, s.t)),
                 esc(&fmt_ts(s.t))
-            )
-            .unwrap();
+            )?;
         }
-        body.push_str("</h2>\n");
+        body.write_all(b"</h2>\n")?;
         if !s.image.is_empty() {
-            writeln!(
-                body,
-                "<img loading=\"lazy\" src=\"{}\" alt=\"视频 {} 的截图\">",
-                esc(&s.image),
-                esc(&fmt_ts(s.t))
-            )
-            .unwrap();
+            let tag = if let Some(label) = image_label(&s.image) {
+                format!("<img loading=\"lazy\" src=\"\" alt=\"{}\">", esc(&label))
+            } else {
+                crate::tr!(
+                    "<img loading=\"lazy\" src=\"{}\" alt=\"视频 {} 的截图\">",
+                    "",
+                    esc(&fmt_ts(s.t))
+                )
+            };
+            let (prefix, suffix) = tag.split_once("src=\"\"").expect("image template has src");
+            write!(body, "{prefix}src=\"")?;
+            image_target(body, &s.image)?;
+            writeln!(body, "\"{suffix}")?;
         }
         for ev in &s.speech {
-            writeln!(body, "<p>{}</p>", rich(&ev.text)).unwrap();
+            writeln!(body, "<p>{}</p>", rich(&ev.text))?;
             if let Some(translation) = &ev.translation {
-                writeln!(body, "<p class=\"translation\">{}</p>", rich(translation)).unwrap();
+                writeln!(body, "<p class=\"translation\">{}</p>", rich(translation))?;
             }
         }
-        body.push_str("</section>\n");
+        body.write_all(b"</section>\n")?;
     }
-    format!(
-        "<!DOCTYPE html>\n<html lang=\"zh\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>{title}</title>\n<style>\n:root {{ color-scheme: light dark; }}\nbody {{ max-width: 920px; margin: 0 auto; padding: 1rem; font-family: system-ui, -apple-system, sans-serif; line-height: 1.7; }}\nheader h1 {{ font-size: 1.5rem; }}\nheader p {{ color: #888; }}\nsection {{ margin: 2rem 0; }}\nsection h2 {{ font-size: 1rem; font-weight: 600; }}\nsection h2 a {{ color: #0969da; text-decoration: none; }}\nimg {{ max-width: 100%; border: 1px solid #8884; border-radius: 6px; }}\np {{ margin: .4rem 0; }}\np.translation {{ color: #777; margin-top: 0; }}\n.math {{ display: inline-block; }}\n.math svg {{ display: block; }}\n.math.display {{ display: block; margin: .6rem auto; max-width: 100%; }}\n</style>\n</head>\n<body>\n{body}</body>\n</html>\n",
-        title = esc(&meta.title),
-    )
+    body.write_all(b"</body>\n</html>\n")?;
+    Ok(())
 }
 
 /// Note text with its formulas typeset; everything else escaped.
@@ -298,6 +391,49 @@ mod tests {
         let link = ts_url_from(&source_url(&meta), 4.0);
         assert!(link.starts_with("file://"));
         assert!(link.ends_with("a%20lesson.mp4#t=4"));
+    }
+
+    #[test]
+    fn slide_pages_render_with_numbers() {
+        let meta = VideoMeta {
+            title: "test".into(),
+            uploader: String::new(),
+            duration: 10.0,
+            webpage_url: String::new(),
+            extractor: "local".into(),
+            id: "x".into(),
+        };
+        let mut second = Section {
+            t: 10.0,
+            end: 20.0,
+            image: "slides/d2-0007.jpg".into(),
+            speech: vec![TranscriptEvent {
+                start: 10.0,
+                end: 20.0,
+                text: "hello".into(),
+                raw: None,
+                translation: None,
+            }],
+        };
+        let first = Section {
+            t: 0.0,
+            end: 10.0,
+            image: "slides/d1-0038.jpg".into(),
+            speech: vec![],
+        };
+        let sections = [first, second.clone()];
+        let md = render_markdown(&meta, &sections);
+        assert!(md.contains("## 第 38 页 · 00:00"), "{md}");
+        assert!(md.contains("## 第 2 套 · 第 7 页 · 00:10"), "{md}");
+        let html = render_html(&meta, &sections);
+        assert!(html.contains("第 38 页 · 00:00"), "{html}");
+        assert!(html.contains("第 2 套 · 第 7 页 · 00:10"), "{html}");
+        second.image = "frames/slide_0001.jpg".into();
+        let md = render_markdown(&meta, &[second]);
+        assert!(
+            !md.contains("第 1 页"),
+            "frames must not gain a page label: {md}"
+        );
     }
 
     #[test]

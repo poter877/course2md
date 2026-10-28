@@ -761,6 +761,123 @@ impl Desktop {
         cx.notify();
     }
 
+    /// 选择视频对应的幻灯片 PDF（可多选）。PDF 只提供成图与页码，
+    /// 视频仍负责判断每页出现的时间。
+    fn choose_slides(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let prompt = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some(course2md::tr!("选择幻灯片 PDF（可多选）").into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = prompt.await;
+            let _ = this.update_in(cx, |this, _, cx| {
+                match result {
+                    Ok(Ok(Some(paths))) => {
+                        if let Some(source) = &mut this.source_preview {
+                            for path in paths {
+                                let is_pdf = path
+                                    .extension()
+                                    .and_then(|ext| ext.to_str())
+                                    .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"));
+                                if is_pdf && !source.slides.contains(&path) {
+                                    source.slides.push(path);
+                                }
+                            }
+                        }
+                        this.save_current_draft(cx);
+                    }
+                    Ok(Ok(None)) => {}
+                    Ok(Err(error)) => {
+                        this.message = Some(course2md::tr!(
+                            "无法打开文件选择器：{}",
+                            format!("{error:#}")
+                        ))
+                    }
+                    Err(error) => this.message = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// 幻灯片 PDF：列出已选文件，允许继续添加或移除。
+    fn slides_view(&self, cx: &mut Context<Self>) -> Div {
+        let Some(source) = &self.source_preview else {
+            return v_flex();
+        };
+        let mut files = v_flex().w_full().min_w_0().gap_2();
+        for (index, path) in source.slides.iter().enumerate() {
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| path.display().to_string());
+            files = files.child(
+                h_flex()
+                    .w_full()
+                    .min_w_0()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        semantic_label(
+                            SharedString::from(format!("import-slide-{index}")),
+                            name,
+                            icons::file_upload()
+                                .size(rems(18. / 14.))
+                                .text_color(color(ACCENT)),
+                        )
+                        .flex_1()
+                        .min_w_0()
+                        .text_ellipsis(),
+                    )
+                    .child(
+                        quiet(SharedString::from(format!("remove-slide-{index}")))
+                            .label(course2md::tr!("移除"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(source) = &mut this.source_preview
+                                    && index < source.slides.len()
+                                {
+                                    source.slides.remove(index);
+                                }
+                                this.save_current_draft(cx);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        if source.slides.is_empty() {
+            files = files.child(help(
+                "import-no-slides",
+                course2md::tr!("还没添加幻灯片 PDF"),
+            ));
+        }
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .gap_3()
+            .pt_4()
+            .border_t_1()
+            .border_color(color(HAIRLINE))
+            .child(section_title(
+                "import-slides-title",
+                course2md::tr!("幻灯片 PDF"),
+            ))
+            .child(help(
+                "import-slides-hint",
+                course2md::tr!("给出 PDF 时，视频只用来判断翻页；成图与页码改用 PDF 页。"),
+            ))
+            .child(files)
+            .child(
+                outline_pill("add-slides", cx)
+                    .icon(icons::file_upload())
+                    .label(course2md::tr!("添加幻灯片 PDF"))
+                    .on_click(cx.listener(|this, _, window, cx| this.choose_slides(window, cx))),
+            )
+    }
+
     fn choose_attached_subtitle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(source) = self.source_preview.clone() else {
             return;
@@ -2272,38 +2389,104 @@ impl Desktop {
                     .or(cached_id.as_deref())
                     .map(|id| format!("track:{id}"))
             };
-            let mut options = v_flex().gap_2().child(
-                div().child(
-                    SingleChoiceGroup::new("import-text-source", course2md::tr!("笔记的文字来源"))
-                        .map(|group| {
-                            choices.iter().fold(group, |group, (value, _)| {
-                                group.icon(
-                                    value.clone(),
-                                    if value == "speech" {
-                                        icons::mic()
-                                    } else {
-                                        icons::subtitles()
-                                    },
-                                )
-                            })
+            // A YouTube probe lists every auto-caption language (often 100+).
+            // Those cannot be laid out as one segmented row without squeezing
+            // every label to a sliver, so pick a compact selector when the list
+            // is long and keep the segmented peer choice for short lists.
+            const INLINE_CHOICE_LIMIT: usize = 6;
+            let picker: AnyElement = if choices.len() <= INLINE_CHOICE_LIMIT {
+                SingleChoiceGroup::new("import-text-source", course2md::tr!("笔记的文字来源"))
+                    .map(|group| {
+                        choices.iter().fold(group, |group, (value, _)| {
+                            group.icon(
+                                value.clone(),
+                                if value == "speech" {
+                                    icons::mic()
+                                } else {
+                                    icons::subtitles()
+                                },
+                            )
                         })
-                        .options(choices)
-                        .when_some(selected, |group, value| group.selected(value))
-                        .on_change(cx.listener(move |this, value: &SharedString, _, cx| {
-                            if value.as_ref() == "speech" {
-                                this.use_speech(cx);
-                            } else if let Some(id) = value.strip_prefix("track:") {
-                                if cached_id.as_deref() == Some(id) {
-                                    this.use_confirmed_subtitle(cx);
-                                } else if let Some(track) =
-                                    tracks.iter().find(|track| track.id == id)
-                                {
-                                    this.confirm_subtitle(track.clone(), true, cx);
-                                }
+                    })
+                    .options(choices)
+                    .when_some(selected, |group, value| group.selected(value))
+                    .on_change(cx.listener(move |this, value: &SharedString, _, cx| {
+                        if value.as_ref() == "speech" {
+                            this.use_speech(cx);
+                        } else if let Some(id) = value.strip_prefix("track:") {
+                            if cached_id.as_deref() == Some(id) {
+                                this.use_confirmed_subtitle(cx);
+                            } else if let Some(track) = tracks.iter().find(|track| track.id == id) {
+                                this.confirm_subtitle(track.clone(), true, cx);
                             }
-                        })),
-                ),
-            );
+                        }
+                    }))
+                    .into_any_element()
+            } else {
+                let entity = cx.weak_entity();
+                let current = selected
+                    .as_ref()
+                    .and_then(|value| {
+                        choices
+                            .iter()
+                            .find(|(choice, _)| choice == value)
+                            .map(|(_, label)| label.clone())
+                    })
+                    .unwrap_or_else(|| course2md::tr!("请选择字幕").to_owned());
+                let menu_choices = choices.clone();
+                let menu_tracks = std::rc::Rc::new(tracks.clone());
+                let menu_cached = cached_id.clone();
+                let menu_selected = selected.clone();
+                SelectField::new("import-text-source", current, move |menu, _, _| {
+                    let mut menu = menu.scrollable(true).max_h(px(320.));
+                    let speech_entity = entity.clone();
+                    let speech_checked = menu_selected.as_deref() == Some("speech");
+                    menu = menu
+                        .item(
+                            PopupMenuItem::new(course2md::tr!("语音识别"))
+                                .icon(icons::mic())
+                                .checked(speech_checked)
+                                .on_click(move |_, _, cx| {
+                                    let _ =
+                                        speech_entity.update(cx, |this, cx| this.use_speech(cx));
+                                }),
+                        )
+                        .separator();
+                    for (value, option_label) in &menu_choices {
+                        let Some(track_id) = value.strip_prefix("track:") else {
+                            continue;
+                        };
+                        let track_id = track_id.to_owned();
+                        let entity = entity.clone();
+                        let tracks = menu_tracks.clone();
+                        let cached = menu_cached.clone();
+                        let checked = menu_selected.as_deref() == Some(value.as_str());
+                        menu = menu.item(
+                            PopupMenuItem::new(option_label.clone())
+                                .icon(icons::subtitles())
+                                .checked(checked)
+                                .on_click(move |_, _, cx| {
+                                    let tracks = tracks.clone();
+                                    let track_id = track_id.clone();
+                                    let cached = cached.clone();
+                                    let _ = entity.update(cx, |this, cx| {
+                                        if cached.as_deref() == Some(track_id.as_str()) {
+                                            this.use_confirmed_subtitle(cx);
+                                        } else if let Some(track) =
+                                            tracks.iter().find(|track| track.id == track_id)
+                                        {
+                                            this.confirm_subtitle(track.clone(), true, cx);
+                                        }
+                                    });
+                                }),
+                        );
+                    }
+                    menu
+                })
+                .label(course2md::tr!("笔记的文字来源"))
+                .into_any_element()
+            };
+            let mut options = v_flex().gap_2().child(div().child(picker));
             if self.subtitle_error.is_none()
                 && let SubtitleEvidence::Found {
                     warning: Some(message),
@@ -2336,16 +2519,14 @@ impl Desktop {
                             .disabled(self.subtitle_loading)
                             .on_click(cx.listener(|this, _, _, cx| this.retry_subtitles(cx))),
                     )
-                    .when(!source.online, |view| {
-                        view.child(
-                            outline_pill("attach-subtitles", cx)
-                                .icon(icons::file_upload())
-                                .label(course2md::tr!("选择字幕文件"))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.choose_attached_subtitle(window, cx)
-                                })),
-                        )
-                    })
+                    .child(
+                        outline_pill("attach-subtitles", cx)
+                            .icon(icons::file_upload())
+                            .label(course2md::tr!("读取本地字幕"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.choose_attached_subtitle(window, cx)
+                            })),
+                    )
                     .when(
                         source.online
                             && course2md::auth::is_bilibili_url(&source.input)
@@ -2445,6 +2626,13 @@ impl Desktop {
     /// AI 处理: one switch tile per step, then the translation target and
     /// the service the text is sent to.
     fn import_ai_options(&self, cx: &mut Context<Self>) -> TileGroup {
+        if !self.preferences.generation().ai_allowed {
+            let tiles = vec![v_flex().p(rems(16. / 14.)).child(supporting_info(
+                "import-ai-disabled",
+                course2md::tr!("已在设置中关闭 AI 处理：不运行校对、摘要、截图辅助与翻译。"),
+            ))];
+            return option_group("import-ai-label", course2md::tr!("AI 处理"), tiles);
+        }
         let custom_rule = self.task_options().llm
             && self
                 .import_base_config()
@@ -3560,9 +3748,10 @@ impl Desktop {
         let text_required = !has_linked_task && self.subtitle_attention_required();
         // Text-source decisions and submission obstacles belong to the
         // previewed video, so they sit inside its card.
+        let previewing = self.source_preview.is_some();
         let preview_extra = if !has_linked_task && self.source_preview.is_some() {
             let recovery = self.conversion_recovery(cx);
-            (text_required || recovery.is_some()).then(|| {
+            (text_required || recovery.is_some() || previewing).then(|| {
                 v_flex()
                     .w_full()
                     .min_w_0()
@@ -3583,6 +3772,7 @@ impl Desktop {
                                 .child(self.text_source_view(cx)),
                         )
                     })
+                    .when(previewing, |extra| extra.child(self.slides_view(cx)))
                     .children(recovery)
             })
         } else {
@@ -4415,6 +4605,7 @@ mod tests {
             ..Default::default()
         };
         let plan = workspace::TaskPlan {
+            slides: Vec::new(),
             operation: Default::default(),
             source: source.clone(),
             source_id: source.identity.clone(),
@@ -4498,6 +4689,7 @@ mod tests {
             ..Default::default()
         };
         let plan = workspace::TaskPlan {
+            slides: Vec::new(),
             operation: Default::default(),
             source: source.clone(),
             source_id: source.identity.clone(),
@@ -4558,6 +4750,7 @@ mod tests {
         let mut original = workspace::TaskRecord {
             id: "original".into(),
             plan: workspace::TaskPlan {
+                slides: Vec::new(),
                 operation: Default::default(),
                 source_id: source.identity.clone(),
                 source,

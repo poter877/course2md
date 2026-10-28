@@ -462,6 +462,13 @@ fn publish_in_task(
             staging.path().join("timeline.jsonl"),
         )?;
     }
+    // 页对齐报告和成图一起发布，便于核对“这页讲的话”是否来自老师。
+    if work_dir.join("alignment.json").is_file() {
+        std::fs::copy(
+            work_dir.join("alignment.json"),
+            staging.path().join("alignment.json"),
+        )?;
+    }
     let mut outputs = Vec::new();
     for format in formats {
         let name = crate::portable::file_name(*format);

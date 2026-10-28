@@ -249,7 +249,7 @@ const TEMPLATE: &str = r#"# course2md 配置 / Configuration
 #cooldown = {COOLDOWN}
 # 下载视频最大高度 / Maximum downloaded video height
 #max_height = {MAX_HEIGHT}
-# first 立即截图，stable 等动画结束 / first: immediate; stable: wait for animations
+# first 立即截图，stable 等动画结束，precise 逐帧不漏 / first: immediate; stable: wait for animations; precise: scan every frame
 #slide_mode = "{SLIDE_MODE}"
 #stable_secs = {STABLE_SECS}
 # 仅比较指定画面区域 / Compare only this region

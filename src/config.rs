@@ -16,6 +16,17 @@ pub const DEFAULT_COOLDOWN: f64 = 10.0;
 pub const DEFAULT_MAX_HEIGHT: u32 = 1080;
 /// stable 模式下画面需保持不变的秒数
 pub const DEFAULT_STABLE_SECS: f64 = 0.8;
+/// 帧↔PDF 页视觉匹配的默认最低分。
+pub const DEFAULT_SLIDE_MATCH_THRESHOLD: f64 = 0.35;
+
+fn default_slide_match_threshold() -> f64 {
+    DEFAULT_SLIDE_MATCH_THRESHOLD
+}
+
+/// 身份文件只在用户改动阈值时才记录该字段，旧的断点续跑身份保持兼容。
+fn is_default_slide_match_threshold(value: &f64) -> bool {
+    (*value - DEFAULT_SLIDE_MATCH_THRESHOLD).abs() < f64::EPSILON
+}
 /// ASR 识别线程数
 pub const DEFAULT_THREADS: i32 = 4;
 /// 单段语音最长秒数（过长会在静音点切分）
@@ -339,13 +350,17 @@ pub fn effective_model(provider: AsrProvider, saved: Option<&str>) -> &str {
     }
 }
 
-/// 截图发射模式：first（首个不同帧）| stable（等待画面稳定，适合动画课件）。
+/// 截图发射模式：
+/// - `first`：首个不同帧立即发射；
+/// - `stable`：等待画面稳定，适合动画课件（默认）；
+/// - `precise`：逐帧分析，稳定态、短暂闪现态和连续变化的过程帧都保留。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SlideMode {
     First,
     #[default]
     Stable,
+    Precise,
 }
 
 impl fmt::Display for TranscriptSource {
@@ -363,6 +378,7 @@ impl fmt::Display for SlideMode {
         f.write_str(match self {
             Self::First => "first",
             Self::Stable => "stable",
+            Self::Precise => "precise",
         })
     }
 }
@@ -441,6 +457,18 @@ pub struct PipelineConfig {
     pub asr_api: crate::settings::AsrApi,
     /// 转写来源：字幕优先 / 强制字幕 / 强制 ASR
     pub transcript_source: TranscriptSource,
+    /// 外部字幕文件（SRT/VTT）；给出时不再查找平台字幕或同名旁挂字幕
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle_file: Option<PathBuf>,
+    /// 外部幻灯片 PDF：视频只用来检测翻页时间，成图与页码改用 PDF 页
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slides: Vec<PathBuf>,
+    /// 帧与 PDF 页的视觉匹配最低分（低于仍保留，但在 alignment.json 标 uncertain）
+    #[serde(
+        default = "default_slide_match_threshold",
+        skip_serializing_if = "is_default_slide_match_threshold"
+    )]
+    pub slide_match_threshold: f64,
     /// 本地识别模型（别名或规范 id，见 [`canonical_model`]）；None = 后端默认
     pub asr_model: Option<String>,
     /// GPU 卸载层数（llama-server -ngl；gpu 后端生效，cpu 后端恒为 0）
@@ -599,6 +627,27 @@ impl PipelineConfig {
             "GPU 层数必须在 0 到 99 之间（当前 {0}）/ GPU layers must be between 0 and 99 (got {0})",
             self.gpu_layers
         );
+        anyhow::ensure!(
+            self.slide_match_threshold.is_finite()
+                && self.slide_match_threshold > 0.0
+                && self.slide_match_threshold <= 1.0,
+            "--slide-match-threshold 必须大于 0 且不超过 1 / must be greater than 0 and at most 1 (received {})",
+            self.slide_match_threshold
+        );
+        for slides in &self.slides {
+            anyhow::ensure!(
+                slides.is_file(),
+                "找不到幻灯片 PDF / Slide PDF not found: {}",
+                slides.display()
+            );
+        }
+        if let Some(subtitle) = &self.subtitle_file {
+            anyhow::ensure!(
+                subtitle.is_file(),
+                "找不到字幕文件 / Subtitle file not found: {}",
+                subtitle.display()
+            );
+        }
 
         Ok(())
     }
@@ -1109,6 +1158,9 @@ mod tests {
             gpu_layers: DEFAULT_GPU_LAYERS,
             mmproj_offload: true,
             transcript_source: TranscriptSource::Auto,
+            subtitle_file: None,
+            slides: Vec::new(),
+            slide_match_threshold: DEFAULT_SLIDE_MATCH_THRESHOLD,
         }
     }
 

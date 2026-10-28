@@ -26,6 +26,7 @@
 - **笔记跟着课件走。**每页幻灯片一张截图，对应的讲解按段落排在下方，保存为普通的 `course.md` 加截图，在哪里都能打开；需要时可以导出网页、.zip 或 JSON。
 - **默认在本机处理。**语音识别在你的电脑上完成：Apple 芯片开箱即用，其他系统可用显卡、CPU 或 Intel Core Ultra 的 NPU。只有选择云端服务时音频才会上传。
 - **有字幕先用字幕。**视频自带字幕时直接使用，无需语音识别。
+- **可以带讲义 PDF。**本地视频可附加幻灯片 PDF 与 SRT/VTT：成图改用 PDF 页、标题带页码，视频只负责判断翻页时间。
 - **AI 可选。**校对、摘要、双语笔记和数学公式排版，支持任意 OpenAI 兼容服务、本地 Ollama 或 ChatGPT 订阅，默认关闭。
 - **四种界面语言。**English、简体中文、繁體中文和日本語，默认跟随系统。
 
@@ -155,6 +156,17 @@ course2md ./lecture.mp4                        # 本地文件
 course2md https://www.youtube.com/watch?v=…    # 或 YouTube / Bilibili 链接
 course2md ./lecture.mp4 -o ./notes             # 指定笔记保存位置
 ```
+
+有讲义 PDF 和现成字幕时，可以让视频只负责“什么时候翻页”，成图改用 PDF 页、文字改用指定字幕：
+
+```sh
+course2md ./lecture.mp4 --slides ./lec02.pdf --subtitle-file ./lec02.srt \
+  --no-llm --no-summarize --formats md,html -o ./notes
+```
+
+- 每页幻灯片按 PDF 页码输出到 `slides/`，笔记标题变成 `第 38 页 · 00:12:34`；
+- 匹配同时看画面（SSIM）和文字（字幕 vs 页文字），对齐结果写在 `alignment.json`，低分页标 `uncertain`；
+- 需要 `pdftoppm` / `pdftotext`（poppler）；`--slides` 可重复，按顺序编号为第 1 套、第 2 套。
 
 第一次运行会询问几项设置；笔记保存在输出目录的 `平台/标题/ID/` 下。
 

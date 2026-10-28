@@ -91,7 +91,7 @@ pub struct RunOpts {
     #[arg(help_heading = "截图 / Slides")]
     pub max_height: Option<u32>,
 
-    /// 截图时机：first 立即，stable 等画面稳定 / Capture immediately or wait for stable slides
+    /// 截图时机：first 立即，stable 等画面稳定，precise 逐帧不漏 / Capture immediately, wait for stable slides, or scan every frame
     #[arg(long, value_enum)]
     #[arg(help_heading = "截图 / Slides")]
     pub slide_mode: Option<crate::config::SlideMode>,
@@ -105,6 +105,21 @@ pub struct RunOpts {
     #[arg(long)]
     #[arg(help_heading = "截图 / Slides")]
     pub roi: Option<String>,
+
+    /// 外部幻灯片 PDF：视频只用来检测翻页，成图与页码改用 PDF 页（可重复，按顺序编号 deck）
+    #[arg(long, value_name = "PDF")]
+    #[arg(help_heading = "幻灯片 / Slides")]
+    pub slides: Vec<PathBuf>,
+
+    /// 外部字幕文件（SRT/VTT），优先于平台字幕与同名旁挂字幕
+    #[arg(long, value_name = "FILE")]
+    #[arg(help_heading = "输入与输出 / Input and output")]
+    pub subtitle_file: Option<PathBuf>,
+
+    /// 帧与 PDF 页的视觉匹配最低分 (0,1]，默认 0.35
+    #[arg(long, value_name = "SCORE")]
+    #[arg(help_heading = "幻灯片 / Slides")]
+    pub slide_match_threshold: Option<f64>,
 
     /// 语音识别线程数（至少 1）/ Speech recognition threads (minimum 1)
     #[arg(long)]

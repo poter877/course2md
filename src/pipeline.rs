@@ -91,7 +91,10 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
     };
     let course_id = execution::digest(source_id.as_bytes());
     let course_dir = cfg.out_root.join(&platform).join(&course_id);
-    let binding = cli_binding(&source_id, cfg, &meta.title);
+    let binding = {
+        let (source_id, cfg, title) = (source_id.clone(), cfg.clone(), meta.title.clone());
+        blocking(move || cli_binding(&source_id, &cfg, &title)).await?
+    };
     let mut task_id = execution::digest(&serde_json::to_vec(&binding)?);
     if !cfg.resume {
         task_id = format!(
@@ -146,8 +149,31 @@ pub async fn run(cfg: &PipelineConfig) -> Result<()> {
 /// The identity a CLI task binds its work directory to; its digest names the task.
 /// Identities record the output root as `out_dir`, the value the settings once
 /// carried there before the pipeline chose the work directory.
-pub(crate) fn cli_binding(source_id: &str, cfg: &PipelineConfig, title: &str) -> serde_json::Value {
-    serde_json::json!({"source_id": source_id, "config": cfg.redacted_for_identity(&cfg.out_root), "title": title})
+pub(crate) fn cli_binding(
+    source_id: &str,
+    cfg: &PipelineConfig,
+    title: &str,
+) -> Result<serde_json::Value> {
+    let mut binding = serde_json::json!({"source_id": source_id, "config": cfg.redacted_for_identity(&cfg.out_root), "title": title});
+    // A filename is not a content identity: replacing an attached file must not
+    // return an already published note or reuse its transcription checkpoint.
+    let subtitle = cfg.subtitle_file.clone().or_else(|| {
+        (cfg.transcript_source != config::TranscriptSource::Asr && Path::new(&cfg.url).is_file())
+            .then(|| crate::subtitle::sidecar_subtitle(Path::new(&cfg.url)))
+            .flatten()
+    });
+    if let Some(path) = subtitle {
+        binding["subtitle_digest"] = serde_json::json!(execution::file_digest(&path)?);
+    }
+    if !cfg.slides.is_empty() {
+        binding["slide_digests"] = serde_json::json!(
+            cfg.slides
+                .iter()
+                .map(|path| execution::file_digest(path))
+                .collect::<Result<Vec<_>>>()?
+        );
+    }
+    Ok(binding)
 }
 
 /// Desktop entry: all mutable configuration and credentials have already been resolved.
@@ -233,7 +259,7 @@ async fn run_task_inner(
     let subtitle = if let Some(events) = &request.subtitle_events {
         Some(events.clone())
     } else if let Some(path) = &request.subtitle {
-        let content = std::fs::read_to_string(path).context(crate::tr!(
+        let content = crate::subtitle::read_subtitle_text(path).context(crate::tr!(
             "无法读取已选字幕 / Cannot read selected subtitles"
         ))?;
         Some(crate::subtitle::parse_subtitle(&content))
@@ -676,6 +702,12 @@ async fn subtitles(
         }
         SubtitleInput::Discover(probed) => probed,
     };
+    if let Some(path) = &cfg.subtitle_file {
+        let content = crate::subtitle::read_subtitle_text(path)?;
+        let events = crate::subtitle::parse_subtitle(&content);
+        execution::validate_events(&events)?;
+        return Ok(Some((events, TranscriptOrigin::SelectedSubtitle)));
+    }
     if cfg.transcript_source == config::TranscriptSource::Asr {
         return Ok(None);
     }
@@ -693,8 +725,7 @@ async fn subtitles(
     };
     match found {
         Some(file) => {
-            let content = std::fs::read_to_string(&file.path)
-                .context(crate::tr!("无法读取字幕文件 / Cannot read subtitle file"))?;
+            let content = crate::subtitle::read_subtitle_text(&file.path)?;
             let events = crate::subtitle::parse_subtitle(&content);
             execution::validate_events(&events)?;
             Ok(Some((
@@ -774,9 +805,24 @@ async fn run_prepared(
     }
     // Subtitle evidence and cloud static validation precede any full media download.
     progress::start(Stage::Subtitle);
-    let selected = subtitles(cfg, job, is_local, input).await?;
+    let cache_path = job.dir.join("transcript.json");
+    let cached = blocking(move || cached_transcript(&cache_path)).await?;
+    // A task's verified binding fixes its selected content. Once transcription
+    // has completed, retries need neither an expiring subtitle URL nor ASR tools.
+    let selected = if cached.is_some() {
+        None
+    } else {
+        subtitles(cfg, job, is_local, input).await?
+    };
     progress::done(Stage::Subtitle);
-    check_tools(cfg, job, is_local, selected.is_none(), credentials).await?;
+    check_tools(
+        cfg,
+        job,
+        is_local,
+        cached.is_none() && selected.is_none(),
+        credentials,
+    )
+    .await?;
     meta.save(&job.meta_path())?;
     let (media_path, media_existed) = acquire_media(cfg, job, is_local).await?;
     job.control.check()?;
@@ -793,7 +839,7 @@ async fn run_prepared(
         },
         async {
             tokio::select! {
-                r = transcript(cfg, job, &media_path, selected) => r,
+                r = transcript(cfg, job, &media_path, selected, cached) => r,
                 e = job.control.watch() => Err(e),
             }
         }
@@ -855,7 +901,55 @@ async fn run_prepared(
         }
     };
     save_timeline(job, &frames, &transcript.events).await?;
-    let mut sections = build_sections(frames, transcript.events, meta.duration);
+    let mut sections = if cfg.slides.is_empty() {
+        build_sections(frames, transcript.events, meta.duration)
+    } else {
+        let pages = crate::slides::prepare(cfg, &job.dir, &job.control).await?;
+        let (work, control, duration, threshold) = (
+            job.dir.clone(),
+            job.control.clone(),
+            meta.duration,
+            cfg.slide_match_threshold,
+        );
+        // Keep SSIM and page-text matching off Tokio workers. The blocking job
+        // cooperatively checks task control so cancellation also stops its CPU work.
+        let (frames, events, spans) = blocking(move || {
+            let spans = crate::align::align(
+                &work,
+                &frames,
+                &pages,
+                &transcript.events,
+                duration,
+                threshold,
+                &control,
+            )?;
+            Ok((frames, transcript.events, spans))
+        })
+        .await?;
+        job.control.check()?;
+        let report = serde_json::json!({
+            "schema": 1,
+            "slides": cfg.slides.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
+            "threshold": cfg.slide_match_threshold,
+            "pages": spans,
+        });
+        crate::checkpoint::atomic_write(
+            &job.dir.join("alignment.json"),
+            &serde_json::to_vec_pretty(&report)?,
+        )?;
+        if spans.is_empty() {
+            build_sections(frames, events, meta.duration)
+        } else {
+            let page_frames: Vec<timeline::FrameEvent> = spans
+                .iter()
+                .map(|span| timeline::FrameEvent {
+                    t: span.t,
+                    image: span.image.clone(),
+                })
+                .collect();
+            timeline::merge(page_frames, events, meta.duration)
+        }
+    };
     timeline::coalesce_sections(&mut sections);
     let (sections, summary) = enrich(sections, cfg, job, meta, &mut outcomes).await?;
     job.control.check()?;
@@ -982,6 +1076,10 @@ async fn check_tools(
     needs_speech: bool,
     credentials: Credentials,
 ) -> Result<()> {
+    if !cfg.slides.is_empty() {
+        crate::error::require_cmd("pdftoppm")?;
+        crate::error::require_cmd("pdftotext")?;
+    }
     if needs_speech {
         let (require_key, allow_environment) = match credentials {
             Credentials::Cli => (true, true),
@@ -1054,11 +1152,13 @@ async fn transcript(
     job: &Job,
     media_path: &Path,
     selected: Option<(Vec<timeline::TranscriptEvent>, TranscriptOrigin)>,
+    cached: Option<TranscriptCache>,
 ) -> Result<TranscriptCache> {
+    if let Some(cache) = cached {
+        return Ok(cache);
+    }
     let cache_path = job.dir.join("transcript.json");
-    let cache = match cached_transcript(&cache_path)?
-        .or_else(|| selected.map(|(events, source)| TranscriptCache { source, events }))
-    {
+    let cache = match selected.map(|(events, source)| TranscriptCache { source, events }) {
         Some(cache) => cache,
         None => {
             progress::start(Stage::Audio);
@@ -1684,6 +1784,9 @@ mod tests {
             gpu_layers: c::DEFAULT_GPU_LAYERS,
             mmproj_offload: true,
             transcript_source: c::TranscriptSource::Asr,
+            subtitle_file: None,
+            slides: Vec::new(),
+            slide_match_threshold: c::DEFAULT_SLIDE_MATCH_THRESHOLD,
         };
         let r = tokio::runtime::Runtime::new().unwrap().block_on(run(&cfg));
         assert!(r.is_err(), "损坏视频必须失败");
@@ -1712,6 +1815,45 @@ mod tests {
         // 失败发生在 llama-server spawn 之前 → 无 llama_server_args 字段
         assert!(v.get("llama_server_args").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cli_identity_tracks_attached_content_and_sidecars() {
+        let root = tempfile::tempdir().unwrap();
+        let video = root.path().join("lecture.mp4");
+        let subtitle = root.path().join("lecture.srt");
+        let slides = root.path().join("deck.pdf");
+        std::fs::write(&video, b"video").unwrap();
+        let mut cfg = crate::options::resolve(
+            video.display().to_string(),
+            &Default::default(),
+            &Default::default(),
+        )
+        .unwrap();
+        let binding = |cfg: &crate::config::PipelineConfig| {
+            super::cli_binding("local:test", cfg, "Lecture").unwrap()
+        };
+        let bare = binding(&cfg);
+        std::fs::write(&subtitle, b"first captions").unwrap();
+        let first = binding(&cfg);
+        assert_ne!(bare, first);
+        std::fs::write(&subtitle, b"other captions").unwrap();
+        assert_ne!(first, binding(&cfg));
+        cfg.subtitle_file = Some(subtitle.clone());
+        let explicit = binding(&cfg);
+        std::fs::write(&subtitle, b"edited captions").unwrap();
+        assert_ne!(explicit, binding(&cfg));
+        cfg.slides = vec![slides.clone()];
+        std::fs::write(&slides, b"first PDF").unwrap();
+        let before = binding(&cfg);
+        std::fs::write(&slides, b"other PDF").unwrap();
+        assert_ne!(before, binding(&cfg));
+        cfg.slides.clear();
+        cfg.subtitle_file = None;
+        cfg.transcript_source = crate::config::TranscriptSource::Asr;
+        let asr = binding(&cfg);
+        std::fs::write(&subtitle, b"irrelevant to forced ASR").unwrap();
+        assert_eq!(asr, binding(&cfg));
     }
 
     #[test]

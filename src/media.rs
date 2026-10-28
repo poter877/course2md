@@ -65,6 +65,8 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub duration: f64,
+    /// 标称帧率；逐帧模式用它把帧序号换算成时间。探测不到时为 30。
+    pub fps: f64,
 }
 
 /// ffprobe `-of json` 输出中我们关心的字段子集。
@@ -79,6 +81,9 @@ struct ProbeJson {
 struct ProbeStream {
     width: Option<u32>,
     height: Option<u32>,
+    /// 形如 "30000/1001" 的帧率分式。
+    r_frame_rate: Option<String>,
+    avg_frame_rate: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -87,7 +92,15 @@ struct ProbeFormat {
     duration: Option<String>,
 }
 
-/// 视频宽高与时长。用 `-of json` 结构化输出，取代按逗号/空白切分的文本解析。
+/// ffprobe 的帧率是分式（"30000/1001"）；0/0 表示未知。
+fn parse_rate(raw: Option<&str>) -> Option<f64> {
+    let (num, den) = raw?.split_once('/')?;
+    let num: f64 = num.trim().parse().ok()?;
+    let den: f64 = den.trim().parse().ok()?;
+    (num > 0.0 && den > 0.0).then(|| num / den)
+}
+
+/// 视频宽高、时长与标称帧率。用 `-of json` 结构化输出，取代按逗号/空白切分的文本解析。
 pub async fn probe_video(media: &Path) -> Option<VideoInfo> {
     let out = probe_output(
         Command::new(crate::tools::program("ffprobe"))
@@ -97,7 +110,7 @@ pub async fn probe_video(media: &Path) -> Option<VideoInfo> {
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=width,height:format=duration",
+                "stream=width,height,r_frame_rate,avg_frame_rate:format=duration",
                 "-of",
                 "json",
             ])
@@ -113,10 +126,15 @@ pub async fn probe_video(media: &Path) -> Option<VideoInfo> {
         .format
         .and_then(|f| f.duration)
         .and_then(|d| d.parse::<f64>().ok())?;
+    let fps = parse_rate(stream.r_frame_rate.as_deref())
+        .or_else(|| parse_rate(stream.avg_frame_rate.as_deref()))
+        .unwrap_or(30.0)
+        .clamp(1.0, 240.0);
     Some(VideoInfo {
         width: stream.width?,
         height: stream.height?,
         duration,
+        fps,
     })
 }
 

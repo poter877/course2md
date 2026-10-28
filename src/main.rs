@@ -558,6 +558,7 @@ fn summarize_note(
         duration: document.meta.duration.max(0.),
         subtitle: None,
         subtitle_events: None,
+        slides: Vec::new(),
         config: file.clone(),
         allow_unauthenticated_asr: false,
         work_dir: course_dir.join(".work").join(&task_id),

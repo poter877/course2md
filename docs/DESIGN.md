@@ -43,6 +43,10 @@ URL ── yt-dlp ─┐
           course.md / course.html / structured.json
 ```
 
+### 外部幻灯片 PDF（`--slides`）
+
+给出 `--slides deck.pdf` 时，视频只用于换页检测：抽帧时间仍是页面切换时间，成图改成 PDF 页（`slides/d{deck}-{page:04}.jpg`），页码写进章节标题。帧与页的对齐由 `src/align.rs` 完成：先按灰度 SSIM 做单调动态规划（允许跳页与动画重复帧），再用 `pdftotext` 抽出的页文字与字幕做加权词重叠，在 ±3 秒内微调页边界；两路都弱的页在 `alignment.json` 里标 `uncertain`。`--subtitle-file` 可直接指定 SRT/VTT，跳过平台字幕与旁挂字幕查找；`--slide-match-threshold` 控制视觉弱判定的阈值。渲染与取字依赖 poppler（`pdftoppm` / `pdftotext`）。
+
 截图与音频提取并行执行。画面检测是三状态机（last_emitted / candidate / 发射）：采样不休眠，`--cooldown` 只限制发射频率，发射时间戳取候选画面首次出现的时间；默认 `--slide-mode stable` 要求画面稳定 `--stable-secs`（默认 0.8s）后才发射，从而跳过 PPT 动画的中间帧。
 
 语音分段（各本地后端共享）：超过 `--max-speech` 的段在目标切点 ±3s 窗口内的能量最低点切断，避免切在词中间；切音频时向两侧静音各填充 0.25s，不进入相邻语音，因此不会产生重复文本。事件时间与切分范围分离（`Seg { start, end, cut_start, cut_end }`）。

@@ -278,6 +278,9 @@ pub struct TaskPlan {
     pub library_id: String,
     pub folder: Option<u64>,
     pub subtitle: Option<PathBuf>,
+    /// 幻灯片 PDF：给出时成图用 PDF 页，视频只负责翻页时间。
+    #[serde(default)]
+    pub slides: Vec<PathBuf>,
     #[serde(serialize_with = "serialize_public_config")]
     pub config: ConfigFile,
     pub asr_service: Option<String>,
@@ -298,6 +301,7 @@ impl TaskPlan {
         if self.library_id != other.library_id
             || self.source_id != other.source_id
             || self.subtitle != other.subtitle
+            || self.slides != other.slides
             || self.asr_service != other.asr_service
             || self.ai_service != other.ai_service
         {
@@ -898,6 +902,41 @@ impl State {
             }
             _ => TaskState::Paused,
         };
+        Ok(())
+    }
+
+    /// Forget a finished task record. Work directories and generated notes stay
+    /// on disk; records that referenced it no longer point at a missing task.
+    pub fn delete_task(&mut self, id: &str) -> Result<()> {
+        let index = self
+            .tasks
+            .iter()
+            .position(|task| task.id == id)
+            .context(course2md::tr!("任务记录不存在"))?;
+        ensure!(
+            self.tasks[index].state.finished(),
+            course2md::tr!("任务尚未结束，请先取消任务")
+        );
+        self.tasks.remove(index);
+        for task in &mut self.tasks {
+            if task.parent.as_deref() == Some(id) {
+                task.parent = None;
+            }
+            if task.handled_by.as_deref() == Some(id) {
+                task.handled_by = None;
+            }
+        }
+        for draft in &mut self.drafts {
+            if draft.retry_of.as_deref() == Some(id) {
+                draft.retry_of = None;
+            }
+            if draft.submitted_task.as_deref() == Some(id) {
+                draft.submitted_task = None;
+            }
+        }
+        if self.selected_task.as_deref() == Some(id) {
+            self.selected_task = None;
+        }
         Ok(())
     }
 
@@ -2665,6 +2704,7 @@ mod tests {
     }
     fn plan(library: &str) -> TaskPlan {
         TaskPlan {
+            slides: Vec::new(),
             operation: Default::default(),
             source: source("lecture.mp4", "课程 A"),
             source_id: "video-a".into(),
@@ -4346,5 +4386,45 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(ws.storage_path()).unwrap(), bytes);
+    }
+
+    #[test]
+    fn deleting_a_finished_task_clears_every_reference_to_it() {
+        let mut state = State::initial(PathBuf::from("/library"), ConversionOptions::default());
+        let library = state.default_library.clone();
+        let mut base = plan(&library);
+        base.source_id = "base".into();
+        base.title = "主任务".into();
+        let (base_id, _) = state.enqueue(base, None).unwrap();
+        state.task_mut(&base_id).unwrap().state = TaskState::Partial;
+        let mut follow = plan(&library);
+        follow.source_id = "follow".into();
+        follow.title = "后续任务".into();
+        let (follow_id, _) = state.enqueue(follow, Some(base_id.clone())).unwrap();
+        state.task_mut(&follow_id).unwrap().state = TaskState::Partial;
+        state.task_mut(&follow_id).unwrap().parent = Some(base_id.clone());
+        state.task_mut(&base_id).unwrap().handled_by = Some(follow_id.clone());
+        state.selected_task = Some(base_id.clone());
+        state.drafts[0].retry_of = Some(base_id.clone());
+        state.drafts[0].submitted_task = Some(base_id.clone());
+
+        state.delete_task(&base_id).unwrap();
+
+        assert!(state.task(&base_id).is_none());
+        assert_eq!(state.task(&follow_id).unwrap().parent, None);
+        assert!(state.tasks.iter().all(|task| task.handled_by.is_none()));
+        assert_eq!(state.selected_task, None);
+        assert_eq!(state.drafts[0].retry_of, None);
+        assert_eq!(state.drafts[0].submitted_task, None);
+    }
+
+    #[test]
+    fn deleting_an_unfinished_task_is_refused() {
+        let mut state = State::initial(PathBuf::from("/library"), ConversionOptions::default());
+        let library = state.default_library.clone();
+        let (id, _) = state.enqueue(plan(&library), None).unwrap();
+        // A queued task has not produced anything yet; it must be cancelled first.
+        assert!(state.delete_task(&id).is_err());
+        assert!(state.task(&id).is_some());
     }
 }

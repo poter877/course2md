@@ -2156,6 +2156,7 @@ mod tests {
         draft.folder = Some(7);
         let draft_id = draft.id.clone();
         let plan = workspace::TaskPlan {
+            slides: Vec::new(),
             operation: course2md::execution::Operation::Generate,
             source: source.clone(),
             source_id: source.identity.clone(),
@@ -2535,6 +2536,7 @@ mod tests {
         let mut config = course2md::settings::ConfigFile::default();
         config.defaults.model_dir = Some(old.join("models"));
         let plan = workspace::TaskPlan {
+            slides: Vec::new(),
             operation: course2md::execution::Operation::Reprocess {
                 base_version_dir: old.join("note/versions/old-version"),
                 components: vec![course2md::execution::Component::Summary],

@@ -111,6 +111,18 @@ pub fn run() -> Result<()> {
             crate::tr!("重跑 install.sh 可安装随包版本")
         )),
     }
+    for name in ["pdftoppm", "pdftotext"] {
+        match crate::tools::locate(name) {
+            Some(found) => {
+                let mut command = Command::new(&found.path);
+                command.arg("-v");
+                let usable = crate::runtime::run_bounded("doctor", &mut command, VERSION_TIMEOUT)
+                    .is_ok_and(|output| output.status.success());
+                check(&mut out, usable, name, &format!("  {}", location(&found)));
+            }
+            None => out.push(format!("- {name}  {}", crate::error::install_hint(name))),
+        }
+    }
     match crate::tools::locate("aria2c") {
         Some(found) => match tool_version(&found.path, &["--version"]) {
             Some(version) => {

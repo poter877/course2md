@@ -122,6 +122,11 @@ pub fn resolve(
             .transcript_source
             .or(d.transcript_source)
             .unwrap_or_default(),
+        subtitle_file: opts.subtitle_file.clone(),
+        slides: opts.slides.clone(),
+        slide_match_threshold: opts
+            .slide_match_threshold
+            .unwrap_or(crate::config::DEFAULT_SLIDE_MATCH_THRESHOLD),
     };
     // Without a configured provider the backend is chosen here, and may be the
     // NPU: a Qwen3 model saved for another backend is not run on it. A model

@@ -92,7 +92,12 @@ fn missing_tool(cmd: &str) -> anyhow::Error {
 
 /// 按平台给一行安装命令（常见包管理器；ffprobe 随 ffmpeg 包提供）。
 pub fn install_hint(cmd: &str) -> String {
-    let pkg = if cmd == "ffprobe" { "ffmpeg" } else { cmd };
+    let pkg = match cmd {
+        "ffprobe" => "ffmpeg",
+        "pdftoppm" | "pdftotext" if cfg!(target_os = "linux") => "poppler-utils",
+        "pdftoppm" | "pdftotext" => "poppler",
+        _ => cmd,
+    };
     let media_tool = matches!(cmd, "ffmpeg" | "ffprobe" | "yt-dlp");
     if cfg!(target_os = "macos") {
         if media_tool {
@@ -103,10 +108,15 @@ pub fn install_hint(cmd: &str) -> String {
     } else if cfg!(target_os = "windows") {
         format!("Windows: winget install {pkg}")
     } else {
+        let arch_pkg = if pkg == "poppler-utils" {
+            "poppler"
+        } else {
+            pkg
+        };
         crate::tr!(
             "Debian/Ubuntu: sudo apt install {}；Arch: sudo pacman -S {}",
             pkg,
-            pkg
+            arch_pkg
         )
     }
 }

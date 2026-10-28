@@ -62,6 +62,9 @@ fn test_cfg(video: &Path, dir: &Path) -> course2md::config::PipelineConfig {
         gpu_layers: course2md::config::DEFAULT_GPU_LAYERS,
         mmproj_offload: true,
         transcript_source: course2md::config::TranscriptSource::Asr,
+        subtitle_file: None,
+        slides: Vec::new(),
+        slide_match_threshold: course2md::config::DEFAULT_SLIDE_MATCH_THRESHOLD,
     }
 }
 
@@ -126,4 +129,196 @@ fn stable_mode_waits_for_settled_state() {
     // 白页 0s 起，1.5s 时稳定满 1.2s 发射；黑页只在 2.5/3.0/3.5s 被采到，
     // 观察到的稳定时长 1.0s < 1.2s，不发射；灰页 4.0s 首现，5.5s 发射。
     assert_eq!(onsets(&cfg, &video), [0.0, 4.0]);
+}
+
+/// precise 模式：逐帧分析，稳定态、颜色高亮和短暂闪现都要保留，
+/// 而持续移动的小光标不产生截图。
+#[test]
+fn precise_mode_keeps_every_visual_state() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("synthetic.mp4");
+
+    // 12s / 10fps / 1280x720 白底：
+    //   2s 新增第一行文字（小方块），4s 新增第二行；
+    //   6.0–6.5s 闪现红色批注，随后消失；
+    //   8s 第一行变成灰色（纯颜色变化）；
+    //   10s 整页变灰（换页）。
+    let filter = [
+        "drawbox=x=100:y=100:w=200:h=40:color=black:t=fill:enable='between(t,2,12)'",
+        "drawbox=x=100:y=200:w=200:h=40:color=black:t=fill:enable='between(t,4,12)'",
+        "drawbox=x=500:y=300:w=200:h=40:color=red:t=fill:enable='between(t,6,6.5)'",
+        "drawbox=x=100:y=100:w=200:h=40:color=gray:t=fill:enable='between(t,8,12)'",
+        "drawbox=x=0:y=0:w=1280:h=720:color=gray:t=fill:enable='between(t,10,12)'",
+    ]
+    .join(",");
+    let st = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi"])
+        .args(["-i", "color=c=white:s=1280x720:d=12:r=10"])
+        .args(["-vf", &filter])
+        .args(["-pix_fmt", "yuv420p"])
+        .arg(&video)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(st.success());
+
+    let cfg = course2md::config::PipelineConfig {
+        slide_mode: course2md::config::SlideMode::Precise,
+        ..test_cfg(&video, dir.path())
+    };
+    let found = onsets(&cfg, &video);
+
+    // 每个视觉状态恰好一张；瞬时批注（6.0s）也在其中。
+    let expected = [0.0, 2.0, 4.0, 6.0, 6.6, 8.0, 10.0];
+    let mut matched = Vec::new();
+    for &want in &expected {
+        let hit = found
+            .iter()
+            .copied()
+            .find(|t| (t - want).abs() < 0.35 && !matched.contains(t));
+        assert!(hit.is_some(), "missing change at {want}s; found {found:?}");
+        matched.push(hit.unwrap());
+    }
+    assert_eq!(
+        matched.len(),
+        found.len(),
+        "unexpected extra screenshots: {found:?}"
+    );
+}
+
+#[test]
+fn precise_short_flash_restores_image_and_subtitle_ownership() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("flash.mp4");
+    // One 10fps frame, shorter than the detector's settling window.
+    make_video(&video, 4, &[("black", 1.99, 2.01)]);
+    let cfg = course2md::config::PipelineConfig {
+        slide_mode: course2md::config::SlideMode::Precise,
+        ..test_cfg(&video, dir.path())
+    };
+    let frames = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(course2md::scene::run(
+            &cfg,
+            &video,
+            &course2md::execution::Job::detached(dir.path().to_path_buf()),
+        ))
+        .unwrap();
+    assert_eq!(
+        frames.iter().map(|f| f.t).collect::<Vec<_>>(),
+        [0.0, 2.0, 2.1]
+    );
+    // Check actual extracted pixels, not only event timestamps.
+    let luminance: Vec<_> = frames
+        .iter()
+        .map(|f| {
+            image::open(dir.path().join(&f.image))
+                .unwrap()
+                .to_luma8()
+                .get_pixel(100, 100)
+                .0[0]
+        })
+        .collect();
+    assert!(
+        luminance[0] > 240 && luminance[1] < 15 && luminance[2] > 240,
+        "{luminance:?}"
+    );
+    let speech = course2md::subtitle::parse_subtitle(
+        "1\n00:00:02,000 --> 00:00:02,080\nflash\n\n2\n00:00:02,100 --> 00:00:03,000\nrestored\n",
+    );
+    let sections = course2md::timeline::merge(frames, speech, 4.0);
+    assert!(sections[0].speech.is_empty());
+    assert_eq!(sections[1].speech[0].text, "flash");
+    assert_eq!(sections[1].end, 2.1);
+    assert_eq!(sections[2].speech[0].text, "restored");
+    assert_eq!(sections[2].end, 4.0);
+}
+
+/// Minimal two-page PDF with different text and background colors.
+fn write_slide_pdf(path: &Path) {
+    let streams = [
+        "1 1 1 rg 0 0 320 180 re f 0 0 0 rg BT /F1 24 Tf 30 90 Td (Alpha) Tj ET",
+        "0 0 0 rg 0 0 320 180 re f 1 1 1 rg BT /F1 24 Tf 30 90 Td (Beta) Tj ET",
+    ];
+    let mut objects = vec![
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R 4 0 R] /Count 2 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 180] /Resources << /Font << /F1 5 0 R >> >> /Contents 6 0 R >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 320 180] /Resources << /Font << /F1 5 0 R >> >> /Contents 7 0 R >>".to_string(),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_string(),
+    ];
+    objects.extend(streams.map(|s| format!("<< /Length {} >>\nstream\n{s}\nendstream", s.len())));
+    let mut pdf = String::from("%PDF-1.4\n");
+    let mut offsets = Vec::new();
+    for (i, object) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.push_str(&format!("{} 0 obj\n{object}\nendobj\n", i + 1));
+    }
+    let xref = pdf.len();
+    pdf.push_str(&format!(
+        "xref\n0 {}\n0000000000 65535 f \n",
+        objects.len() + 1
+    ));
+    for offset in offsets {
+        pdf.push_str(&format!("{offset:010} 00000 n \n"));
+    }
+    pdf.push_str(&format!(
+        "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+        objects.len() + 1
+    ));
+    std::fs::write(path, pdf).unwrap();
+}
+
+#[test]
+fn pdf_prepare_renders_text_and_pages_without_reusing_stale_outputs() {
+    // Poppler is optional in CI; the cancellation tests use a controlled process.
+    if ["pdftoppm", "pdftotext"]
+        .iter()
+        .any(|tool| Command::new(tool).arg("-v").output().is_err())
+    {
+        eprintln!("Poppler unavailable; skipping PDF rendering integration test");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pdf = dir.path().join("slides.pdf");
+    write_slide_pdf(&pdf);
+    let stale = dir.path().join(".slide-match");
+    std::fs::create_dir(&stale).unwrap();
+    std::fs::write(stale.join("full-1-003.jpg"), b"stale partial render").unwrap();
+    std::fs::write(stale.join("low-1-003.png"), b"stale partial render").unwrap();
+    let cfg = course2md::config::PipelineConfig {
+        slides: vec![pdf.clone()],
+        ..test_cfg(&pdf, dir.path())
+    };
+    let pages = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(course2md::slides::prepare(
+            &cfg,
+            dir.path(),
+            &course2md::dispatch::TaskControl::default(),
+        ))
+        .unwrap();
+    assert_eq!(pages.len(), 2);
+    assert_eq!(pages[0].text, "Alpha");
+    assert_eq!(pages[1].text, "Beta");
+    for (i, page) in pages.iter().enumerate() {
+        assert_eq!(page.deck, 1);
+        assert_eq!(page.page, (i + 1) as u32);
+        assert_eq!(page.gray.dimensions(), (320, 180));
+        assert!(image::open(dir.path().join(&page.image)).is_ok());
+    }
+    assert!(pages[0].gray.get_pixel(0, 0).0[0] > 240);
+    assert!(pages[1].gray.get_pixel(0, 0).0[0] < 15);
+    assert!(!std::fs::read_dir(dir.path()).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".slide-match-")
+    }));
 }

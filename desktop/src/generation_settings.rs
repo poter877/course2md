@@ -235,7 +235,7 @@ impl Desktop {
                 course2md::tr!("文字来源"),
                 match value.options.transcript_source {
                     Some(course2md::config::TranscriptSource::Subtitle) => {
-                        course2md::tr!("没有字幕时会提示选择字幕文件或改用语音识别")
+                        course2md::tr!("没有字幕时会提示读取本地字幕或改用语音识别")
                     }
                     Some(course2md::config::TranscriptSource::Asr) => {
                         course2md::tr!("语音识别，不使用现有字幕")
@@ -374,10 +374,30 @@ impl Desktop {
         let mut ai = group("ai-default-settings", course2md::tr!("AI 处理"))
             .child(
                 setting_surface().child(settings_switch_row(
+                    course2md::tr!("启用 AI 处理"),
+                    course2md::tr!("关闭后不运行校对、摘要、截图辅助与翻译"),
+                    Switch::new("default-ai-allowed")
+                        .checked(value.ai_allowed)
+                        .on_click(cx.listener(|this, enabled, _, cx| {
+                            let mut next = this.generation_edit_base();
+                            next.ai_allowed = *enabled;
+                            if !*enabled {
+                                next.ai.enabled = false;
+                                next.ai.summarize = false;
+                                next.ai.vision = false;
+                                next.ai.translate = None;
+                            }
+                            this.commit_generation(next, cx);
+                        })),
+                )),
+            )
+            .child(
+                setting_surface().child(settings_switch_row(
                     course2md::tr!("校对文字和标点"),
                     "",
                     Switch::new("default-ai-proofread")
                         .checked(value.ai.enabled)
+                        .disabled(!value.ai_allowed)
                         .on_click(cx.listener(|this, enabled, _, cx| {
                             let mut next = this.generation_edit_base();
                             next.ai.enabled = *enabled;
@@ -391,6 +411,7 @@ impl Desktop {
                     "",
                     Switch::new("default-ai-summary")
                         .checked(value.ai.summarize)
+                        .disabled(!value.ai_allowed)
                         .on_click(cx.listener(|this, enabled, _, cx| {
                             let mut next = this.generation_edit_base();
                             next.ai.summarize = *enabled;
@@ -404,7 +425,7 @@ impl Desktop {
                     "",
                     Switch::new("default-ai-vision")
                         .checked(value.ai.vision)
-                        .disabled(!value.ai.enabled)
+                        .disabled(!value.ai_allowed || !value.ai.enabled)
                         .on_click(cx.listener(|this, enabled, _, cx| {
                             let mut next = this.generation_edit_base();
                             next.ai.vision = *enabled;
@@ -412,10 +433,14 @@ impl Desktop {
                         })),
                 )),
             );
-        let translation = self.translation_setting(value, [false; 4], cx);
-        ai =
-            ai.tile(move |_| translation)
-                .child(self.service_picker(ServicePurpose::Ai, false, cx));
+        if value.ai_allowed {
+            let translation = self.translation_setting(value, [false; 4], cx);
+            ai = ai.tile(move |_| translation).child(self.service_picker(
+                ServicePurpose::Ai,
+                false,
+                cx,
+            ));
+        }
         // The rule only applies to proofreading, so it appears with it.
         if value.ai.enabled {
             let rules = tile_disclosure(

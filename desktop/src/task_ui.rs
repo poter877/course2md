@@ -1743,9 +1743,92 @@ impl Desktop {
                     .disabled(cancelling)
                     .on_click(intent(Intent::Cancel)),
                 );
+            } else {
+                menu = menu.separator().item(
+                    PopupMenuItem::new(course2md::tr!("删除任务…"))
+                        .icon(icons::delete())
+                        .danger(true)
+                        .on_click(follow(|this, id, window, cx| {
+                            this.confirm_task_delete(id, window, cx)
+                        })),
+                );
             }
             menu
         })
+    }
+
+    /// Ask before forgetting a finished task record. Files already written and
+    /// generated notes stay on disk.
+    pub(crate) fn confirm_task_delete(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(task) = self
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.state.task(&id))
+            .cloned()
+        else {
+            self.workspace_error = Some(course2md::tr!("任务记录不存在").to_string());
+            cx.notify();
+            return;
+        };
+        if !task.state.finished() {
+            self.message = Some(course2md::tr!("任务尚未结束，请先取消任务").into());
+            cx.notify();
+            return;
+        }
+        let title = task.plan.title.clone();
+        let weak = cx.weak_entity();
+        window.open_alert_dialog(cx, move |dialog, _, cx| {
+            let weak = weak.clone();
+            let id = id.clone();
+            confirm_dialog(
+                dialog,
+                course2md::tr!("删除任务"),
+                course2md::tr!("保留任务"),
+                course2md::tr!("删除任务"),
+                true,
+                cx,
+            )
+            .child(accessible_text(
+                "delete-task-consequence",
+                course2md::tr!(
+                    "《{}》将从任务列表移除，已生成的文件和笔记不受影响。",
+                    title
+                ),
+            ))
+            .on_ok(move |_, _, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.delete_task_record(id.clone(), cx);
+                });
+                true
+            })
+        });
+    }
+
+    /// Remove the task record; the list refreshes from the workspace state.
+    fn delete_task_record(&mut self, id: String, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.as_mut() else {
+            return;
+        };
+        match workspace.transaction(|state| state.delete_task(&id)) {
+            Ok(()) => {
+                if self.expanded_task.as_deref() == Some(&id) {
+                    self.expanded_task = None;
+                }
+                self.task_panels_open
+                    .retain(|(_, task_id)| task_id.as_str() != id);
+                cx.notify();
+            }
+            Err(error) => {
+                self.workspace_error =
+                    Some(course2md::tr!("无法删除任务：{}", format!("{error:#}")));
+                cx.notify();
+            }
+        }
     }
 
     /// Expand a row's details, or fold the expanded one.
@@ -2645,6 +2728,9 @@ impl Desktop {
             )
         {
             actions = actions.child(self.adjust_action(task, style, cx));
+            if task.state.finished() {
+                actions = actions.child(self.delete_task_action(task, style, cx));
+            }
         }
         details = details.child(actions);
         // The two expanded rows are one group: they keep detail_row's height and gap_1, not the section spacing.
@@ -2752,6 +2838,24 @@ impl Desktop {
             .on_click(
                 cx.listener(move |this, _, window, cx| this.adjust_task(id.clone(), window, cx)),
             )
+    }
+
+    /// A quiet destructive action for finished tasks; the dialog carries the
+    /// confirmation and the consequence.
+    fn delete_task_action(
+        &self,
+        task: &TaskRecord,
+        style: RecoveryStyle,
+        cx: &mut Context<Self>,
+    ) -> Button {
+        let id = task.id.clone();
+        style
+            .button("delete", &task.id, Emphasis::Quiet, cx)
+            .icon(icons::delete())
+            .label(course2md::tr!("删除任务…"))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.confirm_task_delete(id.clone(), window, cx)
+            }))
     }
 
     /// Collapsing a card unmounts its detail; expanding it later starts fresh.
@@ -3538,6 +3642,7 @@ mod tests {
         crate::workspace::TaskRecord {
             id: id.into(),
             plan: crate::workspace::TaskPlan {
+                slides: Vec::new(),
                 operation: Default::default(),
                 source: source("https://example.test/video", "课程"),
                 source_id: "online:video".into(),
@@ -3780,6 +3885,7 @@ mod tests {
         let mut task = TaskRecord {
             id: "partial-task".into(),
             plan: TaskPlan {
+                slides: Vec::new(),
                 operation: Default::default(),
                 source: source("https://example.test/video", "课程"),
                 source_id: "online:video".into(),

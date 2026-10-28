@@ -32,6 +32,7 @@ fn request(source: &str, source_id: &str, config: ConfigFile) -> execution::Requ
         duration: 61.5,
         subtitle: None,
         subtitle_events: None,
+        slides: Vec::new(),
         config,
         allow_unauthenticated_asr: false,
         work_dir: "/library/bilibili/course-1/.work/task-1".into(),
@@ -63,7 +64,7 @@ fn bindings() -> Vec<(&'static str, serde_json::Value)> {
             &file(),
         )
         .unwrap();
-        crate::pipeline::cli_binding("bilibili:BV1xx", &cfg, "Lecture")
+        crate::pipeline::cli_binding("bilibili:BV1xx", &cfg, "Lecture").unwrap()
     };
     vec![
         ("desktop-online", desktop(&online)),

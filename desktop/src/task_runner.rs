@@ -605,6 +605,12 @@ impl Desktop {
             .clone()
             .unwrap_or_else(|| self.preferences.defaults_config());
         draft.options.apply_to(&mut config);
+        if !self.preferences.generation().ai_allowed {
+            config.llm.enabled = false;
+            config.llm.summarize = false;
+            config.llm.vision = false;
+            config.llm.translate = None;
+        }
         config.defaults.model_dir = Some(course2md::config::model_dir_from(
             config.defaults.model_dir.as_deref(),
         ));
@@ -718,6 +724,7 @@ impl Desktop {
         Ok(TaskPlan {
             operation: Default::default(),
             source_id: source.identity.clone(),
+            slides: source.slides.clone(),
             source,
             title: draft.title.clone(),
             library_id: draft.library_id.clone(),
@@ -777,6 +784,7 @@ impl Desktop {
         Ok(TaskPlan {
             operation: Default::default(),
             source_id: identity.clone(),
+            slides: Vec::new(),
             source: source::Source {
                 input: candidate.input.clone(),
                 title: title.clone(),
@@ -1052,6 +1060,7 @@ impl Desktop {
                 None
             },
             subtitle_events: None,
+            slides: task.plan.slides.clone(),
             config,
             work_dir: task.work_dir.clone(),
             allow_unauthenticated_asr: task
@@ -2422,6 +2431,7 @@ pub(crate) mod tests {
                 );
                 state.enqueue(
                     TaskPlan {
+                        slides: Vec::new(),
                         operation: Default::default(),
                         source: a.clone(),
                         source_id: a.identity.clone(),

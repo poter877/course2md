@@ -776,7 +776,7 @@ stdout 管道已配置	stdout 管道已配置	The stdout pipe is configured	stdo
 截图任务异常终止 / Slide extraction stopped unexpectedly	截图任务异常终止	Screenshot extraction stopped unexpectedly	截圖任務異常終止	スクリーンショットタスクが異常終了しました
 截图失败，原笔记不受影响 / Screenshot extraction failed; the original note is unaffected	截图失败，原笔记不受影响	Screenshot extraction failed; the original note is unaffected	截圖失敗，原筆記不受影響	スクリーンショットは失敗しました。元のノートは影響を受けません
 截图无法读取	截图无法读取	Screenshot can't be read	無法讀取截圖	スクリーンショットを読み込めません
-截图时机：first 立即，stable 等画面稳定 / Capture immediately or wait for stable slides	截图时机：first 立即，stable 等画面稳定	Capture immediately or wait for stable slides	截圖時機：first 立即，stable 等畫面穩定	撮影タイミング：first はすぐに、stable は画面が安定してから
+截图时机：first 立即，stable 等画面稳定，precise 逐帧不漏 / Capture immediately, wait for stable slides, or scan every frame	截图时机：first 立即，stable 等画面稳定，precise 逐帧不漏	Capture immediately, wait for stable slides, or scan every frame	截圖時機：first 立即，stable 等畫面穩定，precise 逐幀不漏	撮影タイミング：first はすぐに、stable は画面が安定してから、precise は全フレームを走査
 截图最短间隔（秒）/ Minimum seconds between screenshots	截图最短间隔（秒）/ Minimum seconds between screenshots	Minimum seconds between screenshots	截圖最短間隔（秒）/ Minimum seconds between screenshots	スクリーンショットの最小間隔（秒）
 截图校对	截图校对	Screenshot proofreading	截圖校對	スクリーンショットの校正
 截图生成未完成	截图生成未完成	Screenshot generation is not completed	截圖生成未完成	スクリーンショットの生成が完了していません
@@ -1004,7 +1004,6 @@ stdout 管道已配置	stdout 管道已配置	The stdout pipe is configured	stdo
 无法读取 {}	无法读取 {}	Unable to read {}	無法讀取 {}	{} を読み取れません
 无法读取 {} / Cannot read {}	无法读取 {}	Cannot read {}	無法讀取 {}	{} を読み取れません
 无法读取任务参数（第 {} 行，第 {} 列）/ Invalid task JSON	无法读取任务参数（第 {} 行，第 {} 列）/ Invalid task JSON	Unable to read task parameters (line {}, column {}) / Invalid task JSON	無法讀取任務參數（第 {} 行，第 {} 列）/ Invalid task JSON	タスクパラメータを読み取れません ({} 行、{} 列) / 無効なタスク JSON
-无法读取字幕文件 / Cannot read subtitle file	无法读取字幕文件	Cannot read subtitle file	無法讀取字幕檔案	字幕ファイルを読み取れません
 无法读取字幕文件 {} / Cannot read subtitle file {}	无法读取字幕文件 {}	Cannot read subtitle file {}	無法讀取字幕檔案 {}	字幕ファイル {} を読み取れません
 无法读取字幕，可重试或改用语音识别	无法读取字幕，可重试或改用语音识别	Unable to read subtitles, please try again or use speech recognition instead	無法讀取字幕，可重試或改用語音辨識	字幕を読み込めません。再試行するか、代わりに音声認識を使用してください。
 无法读取已选字幕 / Cannot read selected subtitles	无法读取已选字幕	Cannot read selected subtitles	無法讀取已選字幕	選択した字幕を読み込めません
@@ -1398,7 +1397,7 @@ stdout 管道已配置	stdout 管道已配置	The stdout pipe is configured	stdo
 没有 JSON	没有 JSON	No JSON	沒有 JSON	JSONなし
 没有匹配的笔记	没有匹配的笔记	No matching notes	沒有匹配的筆記	一致するノートがありません
 没有可保存的输入	没有可保存的输入	No input to save	沒有可儲存的輸入	保存する入力がありません
-没有字幕时会提示选择字幕文件或改用语音识别	没有字幕时会提示选择字幕文件或改用语音识别	If there are no subtitles, you will be prompted to select a subtitle file or use speech recognition instead.	沒有字幕時會提示選擇字幕檔案或改用語音辨識	字幕がない場合は、字幕ファイルを選択するか、代わりに音声認識を使用するように求められます。
+没有字幕时会提示读取本地字幕或改用语音识别	没有字幕时会提示读取本地字幕或改用语音识别	If there are no subtitles, you will be prompted to load a local subtitle file or use speech recognition instead.	沒有字幕時會提示讀取本機字幕或改用語音辨識	字幕がない場合は、ローカル字幕を読み込むか、代わりに音声認識を使用するように求められます。
 没有对应的截图	没有对应的截图	There is no corresponding screenshot	沒有對應的截圖	対応するスクリーンショットはありません
 没有提取到截图	没有提取到截图	No screenshots were extracted	沒有提取到截圖	スクリーンショットは抽出されませんでした
 没有数组	没有数组	No array	沒有陣列	配列がありません
@@ -1869,7 +1868,7 @@ stdout 管道已配置	stdout 管道已配置	The stdout pipe is configured	stdo
 选择 {}	选择 {}	Select {}	選擇 {}	{} を選択
 选择保存位置	选择保存位置	Select save location	選擇儲存位置	保存場所を選択
 选择原视频	选择原视频	Select original video	選擇原影片	元の動画を選択してください
-选择字幕文件	选择字幕文件	Select subtitle file	選擇字幕檔案	字幕ファイルを選択
+读取本地字幕	读取本地字幕	Load local subtitles	讀取本機字幕	ローカル字幕を読み込む
 选择文件	选择文件	Choose file	選擇檔案	ファイルを選択
 选择服务	选择服务	Select service	選擇服務	サービスの選択
 选择未保存，请重试	选择未保存，请重试	The selection was not saved, please try again	選擇未儲存，請重試	選択内容は保存されませんでした。もう一度お試しください。
@@ -2189,3 +2188,31 @@ AI 翻译	AI 翻译	AI translation	AI 翻譯	AI 翻訳
 Intel NPU 不再提供 Qwen3，已改用 Whisper large-v3-turbo	Intel NPU 不再提供 Qwen3，已改用 Whisper large-v3-turbo	Qwen3 is no longer available on Intel NPU; switched to Whisper large-v3-turbo	Intel NPU 不再提供 Qwen3，已改用 Whisper large-v3-turbo	Intel NPU では Qwen3 を利用できなくなったため、Whisper large-v3-turbo に切り替えました
 Intel NPU 不再支持 Qwen3 模型。可用：{}	Intel NPU 不再支持 Qwen3 模型。可用：{}	Qwen3 models are no longer available on Intel NPU. Available: {}	Intel NPU 不再支援 Qwen3 模型。可用：{}	Intel NPU では Qwen3 モデルを利用できなくなりました。利用可能：{}
 识别方式 {} 不支持模型「{}」。可用：{}	识别方式 {} 不支持模型「{}」。可用：{}	The {} backend does not support model "{}". Available: {}	辨識方式 {} 不支援模型「{}」。可用：{}	音声認識方式 {} はモデル「{}」に対応していません。利用可能：{}
+删除任务…	删除任务…	Delete task…	刪除任務…	タスクを削除…
+保留任务	保留任务	Keep task	保留任務	タスクを残す
+删除任务	删除任务	Delete task	刪除任務	タスクを削除
+《{}》将从任务列表移除，已生成的文件和笔记不受影响。	《{}》将从任务列表移除，已生成的文件和笔记不受影响。	“{}” will be removed from the task list. Generated files and notes are kept.	《{}》將從任務列表移除，已產生的檔案和筆記不受影響。	「{}」をタスク一覧から削除します。生成済みのファイルとノートは残ります。
+任务尚未结束，请先取消任务	任务尚未结束，请先取消任务	The task has not finished; cancel it first	任務尚未結束，請先取消任務	タスクはまだ終了していません。先にキャンセルしてください
+无法删除任务：{}	无法删除任务：{}	Unable to delete task: {}	無法刪除任務：{}	タスクを削除できません: {}
+第 {} 页	第 {} 页	Page {}	第 {} 頁	{} ページ
+第 {} 套 · 第 {} 页	第 {} 套 · 第 {} 页	Deck {} · page {}	第 {} 套 · 第 {} 頁	デッキ {} · {} ページ
+幻灯片 PDF	幻灯片 PDF	Slide PDFs	投影片 PDF	スライド PDF
+添加幻灯片 PDF	添加幻灯片 PDF	Add slide PDFs	新增投影片 PDF	スライド PDF を追加
+选择幻灯片 PDF（可多选）	选择幻灯片 PDF（可多选）	Choose slide PDFs (multiple allowed)	選擇投影片 PDF（可多選）	スライド PDF を選択（複数可）
+还没添加幻灯片 PDF	还没添加幻灯片 PDF	No slide PDFs added yet	尚未新增投影片 PDF	スライド PDF は未追加です
+给出 PDF 时，视频只用来判断翻页；成图与页码改用 PDF 页。	给出 PDF 时，视频只用来判断翻页；成图与页码改用 PDF 页。	With PDFs, the video only detects page changes; images and page numbers come from the PDF.	給出 PDF 時，影片只用來判斷翻頁；成圖與頁碼改用 PDF 頁。	PDF を指定すると、動画はページ送りの検出だけに使い、画像とページ番号は PDF から取ります。
+移除	移除	Remove	移除	削除
+关闭后不运行校对、摘要、截图辅助与翻译	关闭后不运行校对、摘要、截图辅助与翻译	When off, proofreading, summaries, image-assisted proofreading and translation do not run	關閉後不執行校對、摘要、截圖輔助與翻譯	オフにすると校正・要約・画像補助・翻訳を実行しません
+已在设置中关闭 AI 处理：不运行校对、摘要、截图辅助与翻译。	已在设置中关闭 AI 处理：不运行校对、摘要、截图辅助与翻译。	AI processing is off in Settings: proofreading, summaries, image-assisted proofreading and translation will not run.	已在設定中關閉 AI 處理：不執行校對、摘要、截圖輔助與翻譯。	設定で AI 処理をオフにしています：校正・要約・画像補助・翻訳は実行されません。
+启用 AI 处理	启用 AI 处理	Enable AI processing	啟用 AI 處理	AI 処理を有効にする
+视频画面（无对应幻灯片）	视频画面（无对应幻灯片）	Video screen (no matching slide)	影片畫面（無對應投影片）	映像画面（対応スライドなし）
+翻译	翻译	Translation	翻譯	翻訳
+无法读取截图用于对齐：{}	无法读取截图用于对齐：{}	Cannot read screenshot for alignment: {}	無法讀取截圖以進行對齊：{}	位置合わせ用のスクリーンショットを読み取れません：{}
+找不到幻灯片 PDF：{}	找不到幻灯片 PDF：{}	Slide PDF not found: {}	找不到投影片 PDF：{}	スライド PDF が見つかりません：{}
+幻灯片渲染页码不完整或不一致：{}	幻灯片渲染页码不完整或不一致：{}	Rendered slide pages are incomplete or inconsistent: {}	投影片轉圖頁碼不完整或不一致：{}	描画されたスライドのページ番号が不完全または不一致です：{}
+无法保存幻灯片页：{}	无法保存幻灯片页：{}	Cannot save slide page: {}	無法儲存投影片頁面：{}	スライドページを保存できません：{}
+无法读取幻灯片缩略图：{}	无法读取幻灯片缩略图：{}	Cannot read slide thumbnail: {}	無法讀取投影片縮圖：{}	スライドのサムネイルを読み取れません：{}
+幻灯片 PDF 没有可用页面	幻灯片 PDF 没有可用页面	The slide PDF has no usable pages.	投影片 PDF 沒有可用頁面	スライド PDF に使用できるページがありません。
+无法启动 {}；请安装 Poppler（pdftoppm / pdftotext）以使用幻灯片 PDF	无法启动 {}；请安装 Poppler（pdftoppm / pdftotext）以使用幻灯片 PDF	Cannot start {}. Install Poppler (pdftoppm / pdftotext) to use slide PDFs.	無法啟動 {}；請安裝 Poppler（pdftoppm / pdftotext）以使用投影片 PDF	{} を起動できません。スライド PDF を使用するには Poppler（pdftoppm / pdftotext）をインストールしてください。
+外部工具 {} 执行失败（退出码 {}）：{}	外部工具 {} 执行失败（退出码 {}）：{}	External tool {} failed (exit code {}): {}	外部工具 {} 執行失敗（結束代碼 {}）：{}	外部ツール {} の実行に失敗しました（終了コード {}）：{}
+幻灯片临时路径无效	幻灯片临时路径无效	The slide temporary path is invalid.	投影片暫存路徑無效	スライドの一時パスが無効です。

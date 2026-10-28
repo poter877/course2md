@@ -3218,6 +3218,7 @@ mod tests {
         let task = |state: TaskState| TaskRecord {
             id: "task-1".into(),
             plan: TaskPlan {
+                slides: Vec::new(),
                 operation: Default::default(),
                 source: Default::default(),
                 source_id: "video-a".into(),

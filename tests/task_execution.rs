@@ -40,6 +40,7 @@ fn request(root: &Path, source: &Path) -> Request {
         author: String::new(),
         duration: 1.,
         subtitle: None,
+        slides: Vec::new(),
         subtitle_events: Some(vec![TranscriptEvent {
             start: 0.,
             end: 1.,
@@ -89,6 +90,111 @@ fn run(root: &Path, request: &Request) -> Output {
     spawn_task(root, request, |_| {})
         .wait_with_output()
         .unwrap()
+}
+
+#[test]
+fn cli_attached_utf16_subtitles_skip_asr_and_same_path_edits_make_a_new_note() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("lecture.mp4");
+    let subtitle = root.path().join("lecture.srt");
+    common::fixture_video(&video, 2);
+    let output = root.path().join("notes");
+    let convert = |body: &str, explicit: bool| {
+        let text = format!("1\n00:00:00,000 --> 00:00:02,000\n{body}\n");
+        let mut encoded = vec![0xff, 0xfe];
+        for word in text.encode_utf16() {
+            encoded.extend(word.to_le_bytes());
+        }
+        std::fs::write(&subtitle, encoded).unwrap();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_course2md"));
+        cmd.arg(&video)
+            .args([
+                "--json",
+                "--no-llm",
+                "--no-summarize",
+                "--provider",
+                "api",
+                "--slide-mode",
+                "first",
+                "--formats",
+                "md",
+            ])
+            .arg("-o")
+            .arg(&output)
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env_remove("COURSE2MD_ASR_API_KEY")
+            .stdin(Stdio::null());
+        if explicit {
+            cmd.arg("--subtitle-file").arg(&subtitle);
+        }
+        let result = cmd.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let result_events = events(&result);
+        assert!(!result_events.iter().any(|event| matches!(
+            event["stage"].as_str(),
+            Some("audio" | "transcribe" | "model/prepare")
+        )));
+    };
+    convert("第一份字幕 without speech recognition", true);
+    convert("修改后的字幕 changed in place", true);
+    convert("旁挂字幕 UTF-16 sidecar", false);
+    let source = format!(
+        "local:sha256:{}",
+        course2md::execution::file_digest(&video).unwrap()
+    );
+    let course = output
+        .join("local")
+        .join(course2md::execution::digest(source.as_bytes()));
+    let versions = std::fs::read_dir(course.join("versions"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(versions.len(), 3);
+    let documents = versions
+        .iter()
+        .map(|dir| std::fs::read_to_string(dir.join("document.json")).unwrap())
+        .collect::<Vec<_>>();
+    for expected in ["第一份字幕", "修改后的字幕", "旁挂字幕"] {
+        assert!(
+            documents.iter().any(|document| document.contains(expected)),
+            "{expected}"
+        );
+    }
+}
+
+#[test]
+fn missing_pdf_tool_fails_before_screenshot_or_transcription_work() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("lecture.mp4");
+    let pdf = root.path().join("slides.pdf");
+    common::fixture_video(&video, 1);
+    std::fs::write(&pdf, b"PDF input, not rendered because preflight fails").unwrap();
+    let mut request = request(root.path(), &video);
+    request.slides = vec![pdf];
+    let result = spawn_task(root.path(), &request, |cmd| {
+        cmd.env("PATH", root.path().join("empty-tool-path"))
+            .env_remove("COURSE2MD_PDFTOPPM")
+            .env_remove("COURSE2MD_PDFTOTEXT");
+    })
+    .wait_with_output()
+    .unwrap();
+    assert!(!result.status.success());
+    let output = String::from_utf8_lossy(&result.stdout);
+    assert!(output.contains("pdftoppm"), "{output}");
+    assert!(!request.work_dir.join("screenshots.json").exists());
+    assert!(!request.work_dir.join("transcript.json").exists());
 }
 fn events(output: &Output) -> Vec<serde_json::Value> {
     assert!(

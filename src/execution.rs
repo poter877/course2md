@@ -78,6 +78,9 @@ pub struct Request {
     pub subtitle: Option<PathBuf>,
     #[serde(default)]
     pub subtitle_events: Option<Vec<TranscriptEvent>>,
+    /// 幻灯片 PDF：视频只用于换页检测，成图与页码改用这些 PDF 页（按顺序编号）
+    #[serde(default)]
+    pub slides: Vec<PathBuf>,
     pub config: ConfigFile,
     #[serde(default)]
     pub allow_unauthenticated_asr: bool,
@@ -169,6 +172,19 @@ impl Request {
         if let Some(events) = &self.subtitle_events {
             validate_events(events)?;
         }
+        for slide in &self.slides {
+            anyhow::ensure!(
+                slide.is_absolute(),
+                crate::tr!("幻灯片 PDF 必须使用绝对路径 / Slide PDF path must be absolute")
+            );
+            anyhow::ensure!(
+                slide.is_file(),
+                crate::tr!(
+                    "找不到幻灯片 PDF / Slide PDF not found: {}",
+                    slide.display()
+                )
+            );
+        }
         if let Operation::Reprocess {
             base_version_dir,
             components,
@@ -206,6 +222,7 @@ impl Request {
         // Recovery is a task invariant, not a configurable preference. Where the
         // task works comes from `work_dir` and `course_dir`, not the settings.
         cfg.resume = true;
+        cfg.slides = self.slides.clone();
         // Never enter Apple's model-choice prompt.
         if cfg
             .asr_model
@@ -229,6 +246,9 @@ impl Request {
         // Storage moves are resolved locations, not a change in the processing plan.
         let mut config = cfg.redacted_for_identity(Path::new(""));
         config["out_root"] = serde_json::Value::String(String::new());
+        if !self.slides.is_empty() {
+            config["slides"] = serde_json::Value::Array(Vec::new());
+        }
         // A missing original file must not change the identity of an AI/export-only
         // continuation. Local content identity is independent of current file presence.
         if Path::new(&self.source).is_absolute() || self.source_id.starts_with("local:") {
@@ -242,6 +262,14 @@ impl Request {
                 .transpose()?
         } else {
             None
+        };
+        let slide_digests = if generating {
+            self.slides
+                .iter()
+                .map(|path| file_digest(path))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
         };
         let needs_source = generating
             || matches!(&self.operation, Operation::Reprocess { components, .. }
@@ -274,7 +302,7 @@ impl Request {
                 serde_json::json!({"kind":"reprocess", "source_id":manifest.source_id, "base_version_id":manifest.version_id,"components":components})
             }
         };
-        Ok(serde_json::json!({
+        let mut binding = serde_json::json!({
             "operation":operation,
             "schema": self.schema, "task_id": self.task_id, "course_id": self.course_id,
             "version_id": self.version_id, "source_id": self.source_id, "title": self.title,
@@ -282,7 +310,11 @@ impl Request {
             "subtitle_digest": subtitle_digest,
             "subtitle_events": self.subtitle_events, "local_digest": local_digest,
             "service_versions": self.service_versions, "allow_unauthenticated_asr":self.allow_unauthenticated_asr,
-        }))
+        });
+        if !slide_digests.is_empty() {
+            binding["slide_digests"] = serde_json::json!(slide_digests);
+        }
+        Ok(binding)
     }
 }
 

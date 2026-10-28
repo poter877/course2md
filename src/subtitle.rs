@@ -336,7 +336,13 @@ pub fn to_srt(events: &[TranscriptEvent]) -> String {
                 index + 1,
                 timestamp(event.start),
                 timestamp(event.end),
-                event.text
+                // Escape ampersands first so literal entity spellings survive a
+                // parse/write/parse cycle along with comparisons and tag-like text.
+                event
+                    .text
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
             )
         })
         .collect()
@@ -468,17 +474,102 @@ fn parse_cue_header(line: &str) -> Option<(f64, f64)> {
     ))
 }
 
-/// 去掉 `<...>` 标签并还原常见实体。
+/// Recognize cue markup, not arbitrary text between comparison operators.
+fn is_cue_tag(tag: &str) -> bool {
+    const NAMES: &[&str] = &["b", "i", "u", "c", "ruby", "rt", "v", "lang"];
+    if let Some(name) = tag.strip_prefix('/') {
+        return NAMES.contains(&name) || name.eq_ignore_ascii_case("font");
+    }
+    // WebVTT inline timestamps have two or three components and milliseconds.
+    if let Some((clock, millis)) = tag.split_once('.') {
+        let parts: Vec<_> = clock.split(':').collect();
+        if (parts.len() == 2 || parts.len() == 3)
+            && parts.iter().enumerate().all(|(index, part)| {
+                (part.len() == 2 || (parts.len() == 3 && index == 0 && part.len() > 2))
+                    && part.bytes().all(|byte| byte.is_ascii_digit())
+            })
+            && millis.len() == 3
+            && millis.bytes().all(|byte| byte.is_ascii_digit())
+            && crate::timeline::parse_timestamp(tag).is_some()
+        {
+            return true;
+        }
+    }
+    let (head, annotation) = tag
+        .split_once(|c: char| c.is_ascii_whitespace())
+        .map_or((tag, None), |(head, rest)| (head, Some(rest.trim())));
+    // Common SRT font styling. Only accept complete, known attribute assignments.
+    if head.eq_ignore_ascii_case("font") {
+        let mut rest = annotation.unwrap_or("");
+        while !rest.is_empty() {
+            let Some((name, value)) = rest.split_once('=') else {
+                return false;
+            };
+            if !["color", "face", "size"]
+                .iter()
+                .any(|known| name.trim().eq_ignore_ascii_case(known))
+            {
+                return false;
+            }
+            let value = value.trim_start();
+            rest = if let Some(quote @ ('\'' | '"')) = value.chars().next() {
+                let Some(end) = value[1..].find(quote) else {
+                    return false;
+                };
+                &value[end + 2..]
+            } else {
+                if value.is_empty() {
+                    return false;
+                }
+                let end = value.find(char::is_whitespace).unwrap_or(value.len());
+                &value[end..]
+            };
+            if !rest.is_empty() && !rest.starts_with(char::is_whitespace) {
+                return false;
+            }
+            rest = rest.trim_start();
+        }
+        return true;
+    }
+    let mut classes = head.split('.');
+    let name = classes.next().unwrap_or_default();
+    NAMES.contains(&name)
+        && classes.all(|class| !class.is_empty())
+        && match annotation {
+            None => true,
+            Some(value) => matches!(name, "v" | "lang") && !value.is_empty(),
+        }
+}
+
+/// Strip recognized subtitle tags, then decode entities exactly once. Unknown
+/// tags and unmatched angle brackets are ordinary text and must survive.
 fn clean_cue_text(line: &str) -> String {
+    let line = line.trim();
     let mut s = String::with_capacity(line.len());
-    let mut in_tag = false;
-    for c in line.trim().chars() {
+    let mut tag_start = None;
+    for (index, c) in line.char_indices() {
         match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => s.push(c),
+            '<' => {
+                if let Some(start) = tag_start {
+                    s.push_str(&line[start..index]);
+                }
+                tag_start = Some(index);
+            }
+            '>' => {
+                if let Some(start) = tag_start.take() {
+                    if !is_cue_tag(&line[start + 1..index]) {
+                        s.push_str(&line[start..=index]);
+                    }
+                } else {
+                    s.push(c);
+                }
+            }
+            _ if tag_start.is_none() => s.push(c),
             _ => {}
         }
+    }
+    if let Some(start) = tag_start {
+        s.push_str(&line[start..]);
     }
     // 注意顺序：&amp; 必须最后替换，否则 "&amp;lt;" 会先被还原成 "&lt;"
     // 再被二次还原成 "<"，造成双重反转义
@@ -727,6 +818,64 @@ second cue
         assert_eq!(ev[0].text, "hello world !");
         assert!((ev[0].start - 61.0).abs() < 1e-3);
         assert_eq!(ev[1].text, "second cue");
+    }
+
+    #[test]
+    fn cue_cleaning_preserves_comparisons_and_unrecognized_markup() {
+        for text in [
+            "x < 3",
+            "x > 3",
+            "1 < x && x > 0",
+            "x <= 3; y >= 2",
+            "Vec<T> 与 <unknown>文字</unknown>",
+            "trailing <",
+            "< unfinished",
+            "<c.>bad class</c.extra>",
+            "<b invalid>text</b invalid>",
+            "<00:99.000> <00:01.2> <1.000>",
+            "<font color=>text</font invalid>",
+            "<font color='red'face='serif'>text",
+        ] {
+            assert_eq!(clean_cue_text(text), text);
+        }
+        assert_eq!(clean_cue_text("x < 3 <b>且</b> y > 2"), "x < 3 且 y > 2");
+    }
+
+    #[test]
+    fn cue_cleaning_retains_supported_vtt_and_srt_tag_semantics() {
+        let text = "<v.teacher Alice Smith><c.yellow.bg_blue><b>你好</b></c> \
+                    <i>world</i> <u>!</u> <lang ja><ruby>漢<rt>かん</rt></ruby></lang>\
+                    <00:01.250><01:02:03.456></v> \
+                    <font color=red face='Noto Sans' size=12>字幕</font>";
+        assert_eq!(clean_cue_text(text), "你好 world ! 漢かん 字幕");
+        assert_eq!(
+            clean_cue_text("&lt;b&gt;text&lt;/b&gt; &amp;lt;"),
+            "<b>text</b> &lt;"
+        );
+    }
+
+    #[test]
+    fn srt_roundtrip_preserves_comparisons_entities_and_literal_tags() {
+        let events = vec![TranscriptEvent {
+            start: 1.125,
+            end: 2.375,
+            text: "x < 3; y > 2 & 世界 <b>literal</b> <00:01.000> &lt; &amp; &nbsp; &quot;".into(),
+            raw: None,
+            translation: None,
+        }];
+        let srt = to_srt(&events);
+        assert!(srt.contains("x &lt; 3; y &gt; 2 &amp;"));
+        assert_eq!(parse_subtitle(&srt), events);
+        assert_eq!(parse_subtitle(&to_srt(&parse_subtitle(&srt))), events);
+    }
+
+    #[test]
+    fn platform_caption_comparisons_survive_srt_cache_roundtrip() {
+        let events =
+            parse_subtitle("WEBVTT\n\n00:01.125 --> 00:02.375\n<c>x &lt; 3 &amp; y &gt; 2</c>\n");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "x < 3 & y > 2");
+        assert_eq!(parse_subtitle(&to_srt(&events)), events);
     }
 
     #[test]

@@ -1020,7 +1020,7 @@ fn note_position_index(
 
 /// The note tab's article as list items: the title (shown on short windows),
 /// the summary as one card, then one item per section: its time, screenshot
-/// and paragraphs side by side. Blocks before the first section stay single
+/// and paragraphs in reading order. Blocks before the first section stay single
 /// items. Items keep the block indexing of the full document, so anchors,
 /// search targets and reading positions resolve to blocks as before.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1031,8 +1031,7 @@ enum NoteItem {
         start: usize,
         end: usize,
     },
-    /// A section heading and its blocks `heading..end`; `ordinal` alternates
-    /// which side the screenshot takes.
+    /// A section heading and its blocks `heading..end`, with its section ordinal.
     Section {
         heading: usize,
         end: usize,
@@ -2086,7 +2085,7 @@ fn page_review_hint(flow: &NoteFlow, heading: usize) -> Option<AnyElement> {
 }
 
 /// A section: the chapter title where one begins with the chip that plays
-/// the source from its time, the paragraphs, then the screenshot.
+/// the source from its time, the screenshot, then its spoken paragraphs.
 fn render_note_section(
     flow: &NoteFlow,
     heading: usize,
@@ -2160,8 +2159,8 @@ fn render_note_section(
         .child(title_row)
         .children(page_review_hint(flow, heading))
         .children(flow.missing_images(heading))
+        .children(images)
         .children(paragraphs)
-        .children(images.map(|image| div().w_full().mt_2().child(image)))
         .into_any_element()
 }
 

@@ -362,10 +362,17 @@ pub fn to_srt(events: &[TranscriptEvent]) -> String {
         .enumerate()
         .map(|(index, event)| {
             format!(
-                "{}\n{} --> {}\n{}\n\n",
+                "{}\n{} --> {}\n{}{}\n\n",
                 index + 1,
                 timestamp(event.start),
                 timestamp(event.end),
+                // Keep the turn boundary through the desktop's SRT cache. It
+                // is hidden again when parsed, before paragraph construction.
+                if begins_speaker_turn(event) {
+                    ">> "
+                } else {
+                    ""
+                },
                 // Escape ampersands first so literal entity spellings survive a
                 // parse/write/parse cycle along with comparisons and tag-like text.
                 event
@@ -468,6 +475,11 @@ pub fn parse_subtitle(content: &str) -> Vec<TranscriptEvent> {
             while i < lines.len() && !lines[i].trim().is_empty() {
                 let source = clean_cue_text(lines[i]);
                 let spoken_line = without_speaker_marker(lines[i]);
+                if spoken_line != lines[i].trim() && !text_parts.is_empty() {
+                    // Several speakers can share one cue. Keep its real time
+                    // range for each turn rather than inventing word timings.
+                    push_cue(&mut out, start, end, &mut text_parts, &mut source_parts);
+                }
                 let cleaned = if spoken_line == lines[i].trim() {
                     source.clone()
                 } else {
@@ -481,29 +493,52 @@ pub fn parse_subtitle(content: &str) -> Vec<TranscriptEvent> {
                 }
                 i += 1;
             }
-            let text = text_parts.join(" ");
-            let source = source_parts.join(" ");
-            let raw = (source != text).then_some(source);
-            // 滚动字幕去重：相邻 cue 文本相同则只保留首个（并延长时长）
-            if !text.is_empty() {
-                match out.last_mut() {
-                    Some(prev) if prev.text == text && prev.raw == raw && start <= prev.end => {
-                        prev.end = end.max(prev.end)
-                    }
-                    _ => out.push(TranscriptEvent {
-                        start,
-                        end,
-                        text,
-                        raw,
-                        translation: None,
-                    }),
-                }
-            }
+            push_cue(&mut out, start, end, &mut text_parts, &mut source_parts);
         } else {
             i += 1;
         }
     }
     out
+}
+
+fn push_cue(
+    out: &mut Vec<TranscriptEvent>,
+    start: f64,
+    end: f64,
+    text_parts: &mut Vec<String>,
+    source_parts: &mut Vec<String>,
+) {
+    let text = text_parts.join(" ");
+    let source = source_parts.join(" ");
+    text_parts.clear();
+    source_parts.clear();
+    if text.is_empty() {
+        return;
+    }
+    let raw = (source != text).then_some(source);
+    match out.last_mut() {
+        // A marked repeated reply can belong to a different speaker. Only
+        // unmarked rolling-caption repeats are safe to coalesce here.
+        Some(prev)
+            if raw.is_none() && prev.raw.is_none() && prev.text == text && start <= prev.end =>
+        {
+            prev.end = end.max(prev.end);
+        }
+        _ => out.push(TranscriptEvent {
+            start,
+            end,
+            text,
+            raw,
+            translation: None,
+        }),
+    }
+}
+
+pub(crate) fn begins_speaker_turn(event: &TranscriptEvent) -> bool {
+    event
+        .raw
+        .as_deref()
+        .is_some_and(|source| without_speaker_marker(source) != source.trim())
 }
 
 fn parse_cue_header(line: &str) -> Option<(f64, f64)> {
@@ -1002,6 +1037,18 @@ second cue
         assert_eq!(events.len(), 2);
         assert!(events[0].raw.is_none());
         assert_eq!(events[1].raw.as_deref(), Some(">> Hello."));
+    }
+
+    #[test]
+    fn repeated_replies_and_turns_inside_one_cue_survive_cache() {
+        let events = parse_subtitle(
+            "1\n00:00:01,000 --> 00:00:03,000\n>> Yes.\n>> Yes.\n\n\
+             2\n00:00:03,000 --> 00:00:04,000\n>> Yes.\n",
+        );
+        assert_eq!(events.len(), 3);
+        assert!(events.iter().all(begins_speaker_turn));
+        assert_eq!((events[1].start, events[1].end), (1.0, 3.0));
+        assert_eq!(parse_subtitle(&to_srt(&events)), events);
     }
 
     #[test]

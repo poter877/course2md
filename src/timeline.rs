@@ -16,9 +16,9 @@ pub struct FrameEvent {
 pub struct TranscriptEvent {
     pub start: f64,
     pub end: f64,
-    /// 展示文本（LLM 校对后的）；未校对时与 raw 相同
+    /// 展示文本（字幕标记清理后，可选 LLM 校对）
     pub text: String,
-    /// ASR 原始文本（provenance；校对后保留）
+    /// ASR / 字幕原始文本（包括说话轮次标记；校对后保留）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<String>,
     /// AI translation into the note's target language (bilingual notes).
@@ -41,6 +41,8 @@ pub struct Section {
 const PARAGRAPH_GAP_SECS: f64 = 3.5;
 /// 段落组织：单段最大字符数（超过则强制分段）。
 const MAX_PARAGRAPH_CHARS: usize = 420;
+/// 接近长度上限时优先在完整句末换段，避免在下一句中间触发上限。
+const SENTENCE_PARAGRAPH_CHARS: usize = 280;
 
 /// 宽容的时间戳解析（字幕 cue、旧导出标题、LLM 大纲时间共用，取三者超集语义）：
 /// `HH:MM:SS` / `MM:SS` / 裸秒数，小数分隔符 `.` 或 `,`，容忍首尾空白、
@@ -198,8 +200,18 @@ pub fn coalesce_sections(sections: &mut [Section]) {
     for section in sections {
         let mut paragraphs: Vec<TranscriptEvent> = Vec::new();
         let mut current: Option<TranscriptEvent> = None;
+        let mut pending_turn: Option<String> = None;
 
         for event in std::mem::take(&mut section.speech) {
+            if crate::subtitle::begins_speaker_turn(&event) {
+                if let Some(paragraph) = current.take() {
+                    paragraphs.push(paragraph);
+                }
+                // Even a filtered filler can introduce a new speaker. Carry
+                // its source into the next readable paragraph, including when
+                // this output is coalesced again during replay.
+                pending_turn = event.raw.clone();
+            }
             let text = event.text.trim();
             if text.is_empty() || is_standalone_filler(text) {
                 continue;
@@ -208,6 +220,8 @@ pub fn coalesce_sections(sections: &mut [Section]) {
             let should_break = current.as_ref().is_some_and(|paragraph| {
                 event.start - paragraph.end > PARAGRAPH_GAP_SECS
                     || paragraph.text.chars().count() + text.chars().count() > MAX_PARAGRAPH_CHARS
+                    || (paragraph.text.chars().count() >= SENTENCE_PARAGRAPH_CHARS
+                        && ends_sentence(&paragraph.text))
             });
             if should_break {
                 paragraphs.push(current.take().expect("paragraph exists when breaking"));
@@ -215,15 +229,24 @@ pub fn coalesce_sections(sections: &mut [Section]) {
 
             match current.as_mut() {
                 Some(paragraph) => {
+                    if let Some(raw) = paragraph.raw.as_mut() {
+                        append_text(raw, event.raw.as_deref().unwrap_or(text));
+                    }
                     append_text(&mut paragraph.text, text);
-                    paragraph.end = event.end;
+                    paragraph.end = paragraph.end.max(event.end);
                 }
                 None => {
+                    let raw = pending_turn.take().map(|mut source| {
+                        if !crate::subtitle::begins_speaker_turn(&event) {
+                            append_text(&mut source, text);
+                        }
+                        source
+                    });
                     current = Some(TranscriptEvent {
                         start: event.start,
                         end: event.end,
                         text: text.to_string(),
-                        raw: None,
+                        raw,
                         translation: None,
                     });
                 }
@@ -234,6 +257,11 @@ pub fn coalesce_sections(sections: &mut [Section]) {
         }
         section.speech = paragraphs;
     }
+}
+
+fn ends_sentence(text: &str) -> bool {
+    text.trim_end_matches(['\"', '\'', '”', '’', '」', '』', ')', '）'])
+        .ends_with(['.', '!', '?', '。', '！', '？'])
 }
 
 /// Whether a transcript has any text worth publishing or reusing.
@@ -422,6 +450,86 @@ mod tests {
         let parts = split_at_natural_boundaries(ev.clone(), &[10.0, 20.0]);
         assert_eq!(parts.len(), 1, "任一边界无自然断点则整段保留：{parts:?}");
         assert_eq!(parts[0].text, ev.text);
+    }
+
+    #[test]
+    fn subtitle_turns_split_paragraphs_and_keep_continuations_through_cache_and_replay() {
+        let cues = crate::subtitle::parse_subtitle(
+            "1\n00:00:06,480 --> 00:00:09,360\nCheck. Check. This is working folks\n\n\
+             2\n00:00:09,360 --> 00:00:12,000\nonline.\n\n\
+             3\n00:00:12,000 --> 00:00:13,599\n>> Sorry. Ask what?\n\n\
+             4\n00:00:13,599 --> 00:00:15,440\n>> Uh you might want to ask the people to\n\n\
+             5\n00:00:15,440 --> 00:00:18,000\nchat if they're seeing your presentation properly.\n",
+        );
+        for speech in [
+            cues.clone(),
+            crate::subtitle::parse_subtitle(&crate::subtitle::to_srt(&cues)),
+        ] {
+            let mut sections = vec![Section {
+                t: 0.,
+                end: 20.,
+                image: "f.jpg".into(),
+                speech,
+            }];
+            coalesce_sections(&mut sections);
+            let paragraphs = sections[0].speech.clone();
+            assert_eq!(paragraphs.len(), 3);
+            assert_eq!(
+                paragraphs[0].text,
+                "Check. Check. This is working folks online."
+            );
+            assert_eq!(paragraphs[1].text, "Sorry. Ask what?");
+            assert_eq!(
+                paragraphs[2].text,
+                "Uh you might want to ask the people to chat if they're seeing your presentation properly."
+            );
+            assert_eq!((paragraphs[2].start, paragraphs[2].end), (13.599, 18.));
+            coalesce_sections(&mut sections);
+            assert_eq!(sections[0].speech, paragraphs);
+        }
+    }
+
+    #[test]
+    fn filtered_filler_still_starts_a_new_turn() {
+        let speech = crate::subtitle::parse_subtitle(
+            "1\n00:00:00,000 --> 00:00:01,000\n第一位说话。\n\n\
+             2\n00:00:01,000 --> 00:00:02,000\n>> 嗯\n\n\
+             3\n00:00:02,000 --> 00:00:03,000\n第二位回答。\n",
+        );
+        let mut sections = vec![Section {
+            t: 0.,
+            end: 3.,
+            image: "f.jpg".into(),
+            speech,
+        }];
+        coalesce_sections(&mut sections);
+        assert_eq!(sections[0].speech.len(), 2);
+        assert_eq!(sections[0].speech[1].text, "第二位回答。");
+        let paragraphs = sections[0].speech.clone();
+        coalesce_sections(&mut sections);
+        assert_eq!(sections[0].speech, paragraphs);
+    }
+
+    #[test]
+    fn long_paragraph_prefers_sentence_end_over_next_cue_limit() {
+        for ending in ["。", ".", "！』", "?\""] {
+            let mut first = sp(0., 2.);
+            first.text = format!("{}{ending}", "字".repeat(280));
+            let mut second = sp(2., 4.);
+            second.text = "下一句刚开始".into();
+            let mut third = sp(4., 6.);
+            third.text = "还有后半句。".into();
+            let mut sections = vec![Section {
+                t: 0.,
+                end: 6.,
+                image: "f.jpg".into(),
+                speech: vec![first.clone(), second, third],
+            }];
+            coalesce_sections(&mut sections);
+            assert_eq!(sections[0].speech.len(), 2);
+            assert_eq!(sections[0].speech[0].text, first.text);
+            assert_eq!(sections[0].speech[1].text, "下一句刚开始还有后半句。");
+        }
     }
 
     #[test]

@@ -325,6 +325,13 @@ fn processing_issues(manifest: &artifact::Manifest) -> Vec<ProcessingIssue> {
     .collect()
 }
 #[derive(Clone)]
+pub struct PageReview {
+    /// Heading block in this exact preview; never a PDF page index.
+    pub block: usize,
+    pub seconds: f64,
+}
+
+#[derive(Clone)]
 pub struct Preview {
     pub course: Course,
     pub blocks: Vec<PreviewBlock>,
@@ -335,6 +342,84 @@ pub struct Preview {
     pub issues: Vec<String>,
     /// Incomplete processing is recoverable through its task, never by re-reading files.
     pub processing_issues: Vec<ProcessingIssue>,
+    /// Saved PDF matches requiring comparison with the original video.
+    pub page_reviews: Vec<PageReview>,
+}
+
+#[derive(serde::Deserialize)]
+struct AlignmentReport {
+    schema: u32,
+    pages: Vec<AlignmentPage>,
+}
+
+#[derive(serde::Deserialize)]
+struct AlignmentPage {
+    t: f64,
+    image: String,
+    uncertain: bool,
+}
+
+/// Called by `read_preview` on its worker while holding the version read guard.
+/// The report is optional for older notes; invalid reports cannot hide the body.
+fn read_page_reviews(
+    dir: &Path,
+    document: &artifact::Document,
+    blocks: &[PreviewBlock],
+) -> Result<Vec<PageReview>> {
+    use std::io::Read;
+    const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
+    match std::fs::symlink_metadata(dir.join("alignment.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        result => {
+            result?;
+        }
+    }
+    let path = artifact::safe_asset_path(dir, "alignment.json")?;
+    anyhow::ensure!(
+        std::fs::metadata(&path)?.is_file(),
+        "invalid alignment file"
+    );
+    let file = std::fs::File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() as u64 <= MAX_REPORT_BYTES,
+        "alignment file too large"
+    );
+    let report: AlignmentReport = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(report.schema == 1, "unsupported alignment schema");
+    let mut headings = std::collections::HashMap::new();
+    for (block, value) in blocks.iter().enumerate() {
+        if let PreviewBlock::Heading { anchor, .. } = value
+            && let Some(section) = anchor
+                .strip_prefix("section-")
+                .and_then(|value| value.parse::<usize>().ok())
+            && let Some(section) = document.sections.get(section)
+        {
+            headings
+                .entry((section.t.to_bits(), section.image.as_str()))
+                .or_insert_with(Vec::new)
+                .push(block);
+        }
+    }
+    let mut reviews = std::collections::BTreeMap::new();
+    for page in report.pages {
+        anyhow::ensure!(page.t.is_finite() && page.t >= 0., "invalid alignment time");
+        let matches = headings.get(&(page.t.to_bits(), page.image.as_str()));
+        let Some([block]) = matches.map(Vec::as_slice) else {
+            anyhow::bail!("alignment does not match note sections");
+        };
+        if page.uncertain {
+            reviews.insert(
+                *block,
+                PageReview {
+                    block: *block,
+                    seconds: page.t,
+                },
+            );
+        }
+    }
+    Ok(reviews.into_values().collect())
 }
 
 pub fn read_preview(mut course: Course) -> Result<Preview> {
@@ -423,6 +508,10 @@ pub fn read_preview(mut course: Course) -> Result<Preview> {
             }
         }
     }
+    let page_reviews = read_page_reviews(&course.dir, &document, &blocks).unwrap_or_else(|_| {
+        issues.push(course2md::tr!("PDF 页面的核对信息暂时无法读取，笔记正文仍可阅读。").into());
+        Vec::new()
+    });
     let processing_issues = processing_issues(&manifest);
     course.title = manifest.title.clone();
     course.slides = manifest.frames.len();
@@ -437,6 +526,7 @@ pub fn read_preview(mut course: Course) -> Result<Preview> {
         document,
         issues,
         processing_issues,
+        page_reviews,
     })
 }
 
@@ -556,6 +646,129 @@ pub(crate) mod fixtures {
 #[cfg(test)]
 mod tests {
     use super::{fixtures::published_note, *};
+
+    fn saved_alignment(preview: &Preview, uncertain: &[usize]) -> serde_json::Value {
+        serde_json::json!({
+            "schema": 1,
+            "slides": ["private-input.pdf"],
+            "threshold": 0.35,
+            "pages": preview.document.sections.iter().enumerate().map(|(index, section)| {
+                serde_json::json!({
+                    "t": section.t, "image": section.image, "uncertain": uncertain.contains(&index),
+                    // PDF page numbers are deliberately unrelated to paragraph indices.
+                    "page": 50 + index, "deck": 1, "page_number": 51 + index,
+                    "visual": 0.1, "text": 0.1, "keywords": [],
+                })
+            }).collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn pdf_review_is_optional_and_only_marks_the_uncertain_sections() {
+        let root = tempfile::tempdir().unwrap();
+        let course = published_note(root.path(), 1, &[10., 20., 30.], Default::default());
+        let initial = read_preview(course.clone()).unwrap();
+        assert!(initial.page_reviews.is_empty());
+        assert!(initial.issues.is_empty());
+        let report_path = course.dir.join("alignment.json");
+        std::fs::write(&report_path, saved_alignment(&initial, &[]).to_string()).unwrap();
+        let confident = read_preview(course.clone()).unwrap();
+        assert!(confident.page_reviews.is_empty());
+        assert!(confident.issues.is_empty());
+
+        let mut report = saved_alignment(&initial, &[1, 2]);
+        report["pages"].as_array_mut().unwrap().reverse();
+        // Duplicate reports for the same match must not duplicate the warning.
+        let duplicate = report["pages"][0].clone();
+        report["pages"].as_array_mut().unwrap().push(duplicate);
+        std::fs::write(&report_path, report.to_string()).unwrap();
+        let preview = read_preview(course).unwrap();
+        assert!(preview.issues.is_empty());
+        assert_eq!(preview.page_reviews.len(), 2);
+        for (review, section) in preview.page_reviews.iter().zip([1, 2]) {
+            assert_eq!(review.seconds, preview.document.sections[section].t);
+            assert!(
+                matches!(&preview.blocks[review.block], PreviewBlock::Heading { anchor, seconds, .. }
+                if anchor == &format!("section-{section}") && *seconds == Some(review.seconds))
+            );
+        }
+        assert_eq!(preview.plain_text, initial.plain_text);
+        assert_eq!(preview.markdown_text, initial.markdown_text);
+    }
+
+    #[test]
+    fn repeated_pdf_page_images_use_their_own_video_time() {
+        let root = tempfile::tempdir().unwrap();
+        let course = published_note(root.path(), 1, &[10., 20.], Default::default());
+        let mut preview = read_preview(course).unwrap();
+        preview.document.sections[1].image = preview.document.sections[0].image.clone();
+        std::fs::write(
+            preview.course.dir.join("alignment.json"),
+            saved_alignment(&preview, &[1]).to_string(),
+        )
+        .unwrap();
+        let _guard = course2md::note_edit::read_guard(&preview.course.dir).unwrap();
+        let reviews =
+            read_page_reviews(&preview.course.dir, &preview.document, &preview.blocks).unwrap();
+        assert_eq!(reviews.len(), 1);
+        assert_eq!(reviews[0].seconds, 20.);
+        assert!(
+            matches!(&preview.blocks[reviews[0].block], PreviewBlock::Heading { anchor, .. } if anchor == "section-1")
+        );
+    }
+
+    #[test]
+    fn malformed_or_stale_pdf_review_information_keeps_the_note_readable() {
+        let root = tempfile::tempdir().unwrap();
+        let course = published_note(root.path(), 1, &[10.], Default::default());
+        let initial = read_preview(course.clone()).unwrap();
+        let mut stale = saved_alignment(&initial, &[0]);
+        stale["pages"][0]["t"] = 11.into();
+        let mut invalid_time = saved_alignment(&initial, &[0]);
+        invalid_time["pages"][0]["t"] = (-1).into();
+        let mut wrong_image = saved_alignment(&initial, &[0]);
+        wrong_image["pages"][0]["image"] = "../other-note/image.png".into();
+        for contents in [
+            "{".to_owned(),
+            r#"{"schema":2,"pages":[]}"#.into(),
+            r#"{"schema":1}"#.into(),
+            stale.to_string(),
+            invalid_time.to_string(),
+            wrong_image.to_string(),
+        ] {
+            std::fs::write(course.dir.join("alignment.json"), contents).unwrap();
+            let preview = read_preview(course.clone()).unwrap();
+            assert!(preview.page_reviews.is_empty());
+            assert_eq!(preview.plain_text, initial.plain_text);
+            assert_eq!(
+                preview.issues,
+                [course2md::tr!(
+                    "PDF 页面的核对信息暂时无法读取，笔记正文仍可阅读。"
+                )]
+            );
+        }
+        let file = std::fs::File::create(course.dir.join("alignment.json")).unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+        let preview = read_preview(course).unwrap();
+        assert_eq!(preview.plain_text, initial.plain_text);
+        assert_eq!(preview.issues.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pdf_review_file_cannot_escape_the_note_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let course = published_note(root.path(), 1, &[10.], Default::default());
+        let initial = read_preview(course.clone()).unwrap();
+        let report = outside.path().join("alignment.json");
+        std::fs::write(&report, saved_alignment(&initial, &[0]).to_string()).unwrap();
+        std::os::unix::fs::symlink(report, course.dir.join("alignment.json")).unwrap();
+        let preview = read_preview(course).unwrap();
+        assert!(preview.page_reviews.is_empty());
+        assert_eq!(preview.plain_text, initial.plain_text);
+        assert_eq!(preview.issues.len(), 1);
+    }
 
     #[test]
     fn translations_follow_their_paragraphs_in_the_reader() {

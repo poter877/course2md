@@ -45,7 +45,7 @@ URL ── yt-dlp ─┐
 
 ### 外部幻灯片 PDF（`--slides`）
 
-给出 `--slides deck.pdf` 时，视频只用于换页检测：抽帧时间仍是页面切换时间，成图改成 PDF 页（`slides/d{deck}-{page:04}.jpg`），页码写进章节标题。帧与页的对齐由 `src/align.rs` 完成：先按灰度 SSIM 做单调动态规划（允许跳页与动画重复帧），再用 `pdftotext` 抽出的页文字与字幕做加权词重叠，在 ±3 秒内微调页边界；两路都弱的页在 `alignment.json` 里标 `uncertain`。`--subtitle-file` 可直接指定 SRT/VTT，跳过平台字幕与旁挂字幕查找；`--slide-match-threshold` 控制视觉弱判定的阈值。渲染与取字依赖 poppler（`pdftoppm` / `pdftotext`）。
+给出 `--slides deck.pdf` 时，可靠匹配的截图替换为 PDF 页（`slides/d{deck}-{page:04}.jpg`），页码写进章节标题；缺乏可靠匹配的演示、白板等画面保留视频截图。帧与页的对齐由 `src/align.rs` 完成：比较局部结构并按可见内容加权，避免大面积空白抬高不同页面的相似度；可靠锚点允许跳页、回看和切换 PDF。再用 `pdftotext` 抽出的页文字与字幕做加权词重叠，在 ±3 秒内微调页边界。需核对的结果在 `alignment.json` 里标 `uncertain`，桌面阅读器提供定位入口。`--subtitle-file` 可直接指定 SRT/VTT，跳过平台字幕与旁挂字幕查找；`--subtitle-offset` 调整原始字幕的时间，正数延后、负数提前，不改动字幕文件或语音识别结果；`--slide-match-threshold` 控制视觉弱判定的阈值。渲染与取字依赖 poppler（`pdftoppm` / `pdftotext`）。
 
 截图与音频提取并行执行。画面检测是三状态机（last_emitted / candidate / 发射）：采样不休眠，`--cooldown` 只限制发射频率，发射时间戳取候选画面首次出现的时间；默认 `--slide-mode stable` 要求画面稳定 `--stable-secs`（默认 0.8s）后才发射，从而跳过 PPT 动画的中间帧。
 

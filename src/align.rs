@@ -1,6 +1,6 @@
 //! 视频帧 ↔ 幻灯片页对齐：视觉相似度定时间，字幕文本做校验与边界微调。
 //!
-//! 视觉一路用灰度 SSIM 选取可靠锚点，允许跳页与动画重复帧；
+//! 视觉一路用内容加权的局部结构相似度选取可靠锚点，允许跳页与动画重复帧；
 //! 文本一路把每页 `pdftotext` 的文字和该时间段内的字幕做加权词重叠，并在
 //! ±几秒内移动页边界，让“这一页说的内容”与“这一页显示的文字”尽量一致。
 //! 两路都弱的页标 `uncertain`，写进 alignment.json，渲染时也提示待核对。
@@ -10,7 +10,6 @@ use crate::slides::SlidePage;
 use crate::timeline::{FrameEvent, TranscriptEvent};
 use anyhow::{Context, Result};
 use image::{GrayImage, imageops::FilterType};
-use image_compare::Algorithm;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
@@ -23,12 +22,10 @@ const REFINE_STEP: f64 = 0.5;
 /// 文本分降到这个比例以下、且视觉也不高时，标记 uncertain。
 const WEAK_TEXT: f64 = 0.2;
 /// 单帧最佳匹配低于此分就不当“锚点”：黑屏、过渡帧或画面异常不应
-/// 把对齐拖偏；短过渡继承邻页，长不匹配区间保留视频画面。
+/// 把对齐拖偏；没有可靠内容证据的画面保留视频截图。
 const ANCHOR_SCORE: f64 = 0.5;
 /// 最佳页必须比第二名高出这个分差，单帧噪声才不会被当成新的一页。
 const ANCHOR_MARGIN: f64 = 0.03;
-/// 一段连续对不上任何 PDF 页的画面，超过这个时长就保留为视频截图。
-const VIDEO_MIN_SECS: f64 = 4.0;
 
 /// 一页在时间轴上的位次。
 #[derive(Debug, Clone, serde::Serialize)]
@@ -102,28 +99,10 @@ pub fn align(
             while i < frames.len() && page_of[i].is_none() {
                 i += 1;
             }
-            let end_t = frames.get(i).map_or(media_end, |frame| frame.t);
-            let visual = (start..i).map(|k| scores[k].best).fold(0.0f64, f64::max);
-            if end_t - frames[start].t >= VIDEO_MIN_SECS {
-                // 每张已检测的画面都有自己的时间归属；整段只留首帧会丢掉
-                // 后续演示/白板步骤，并把这些步骤的字幕错归到首张截图。
-                for k in start..i {
-                    spans.push(video_span(&frames[k], scores[k].best));
-                }
-            } else if let Some(prev) = spans.last().and_then(|span| span.page) {
-                // 短过渡帧：继承上一页，不单独成段。
-                spans.push(slide_span_with(prev, pages, frames[start].t, visual));
-            } else if let Some((_, next)) = page_of
-                .iter()
-                .enumerate()
-                .skip(i)
-                .find_map(|(index, page)| page.map(|page| (index, page)))
-            {
-                spans.push(slide_span_with(next, pages, frames[start].t, visual));
-            } else {
-                for k in start..i {
-                    spans.push(video_span(&frames[k], scores[k].best));
-                }
+            // Duration is not evidence of page identity. Even a one-frame poll
+            // or demonstration must retain its own image and subtitle interval.
+            for k in start..i {
+                spans.push(video_span(&frames[k], scores[k].best));
             }
         }
     }
@@ -142,25 +121,10 @@ pub fn align(
     if merged.is_empty() {
         return Ok(Vec::new());
     }
-    // 去掉“夹在两段同一套之间”的单页错配，以及第二套开始后倒回第一套的尾页。
-    let mut filtered: Vec<SlideSpan> = Vec::new();
-    let mut max_deck = 0usize;
-    for (index, span) in merged.iter().enumerate() {
-        let Some(deck) = span.deck else {
-            filtered.push(span.clone());
-            continue;
-        };
-        let prev_deck = filtered.last().and_then(|last| last.deck);
-        let next_deck = merged.get(index + 1).and_then(|next| next.deck);
-        let isolated = prev_deck.is_some_and(|prev| prev != deck)
-            && next_deck.is_some_and(|next| next != deck);
-        if isolated || deck < max_deck {
-            continue;
-        }
-        max_deck = max_deck.max(deck);
-        filtered.push(span.clone());
-    }
-    let mut spans = filtered;
+    // Deck/page order is not temporal evidence: lecturers revisit earlier pages
+    // and switch decks. Confidence already gates anchors; never erase a reliable
+    // return merely because its deck number decreases or it is a single page.
+    let mut spans = merged;
     let index = TextIndex::new(pages, speech, control)?;
     refine_boundaries(&mut spans, &index, media_end, control)?;
     let ends: Vec<f64> = (0..spans.len())
@@ -169,7 +133,7 @@ pub fn align(
     for (i, span) in spans.iter_mut().enumerate() {
         control.check()?;
         let Some(page) = span.page else {
-            span.uncertain = span.visual < threshold;
+            span.uncertain = true;
             continue;
         };
         let (score, keywords) = index.score(page, span.t, ends[i], true);
@@ -251,8 +215,16 @@ fn score_frames(
     control.check()?;
     let mut groups: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
     for (i, page) in pages.iter().enumerate() {
+        control.check()?;
         groups.entry(page.gray.dimensions()).or_default().push(i);
     }
+    let content: Vec<_> = pages
+        .iter()
+        .map(|page| {
+            control.check()?;
+            Ok(ContentImage::new(&page.gray))
+        })
+        .collect::<Result<_>>()?;
     let workers = std::thread::available_parallelism()
         .map(|value| value.get())
         .unwrap_or(4)
@@ -265,6 +237,7 @@ fn score_frames(
             let start = index * chunk;
             let frames = &frames[start..start + rows.len()];
             let groups = &groups;
+            let content = &content;
             handles.push(scope.spawn(move || -> Result<()> {
                 for (row, frame) in rows.iter_mut().zip(frames) {
                     control.check()?;
@@ -277,17 +250,12 @@ fn score_frames(
                             resized = fit(frame, w, h);
                             &resized
                         };
+                        let left = ContentImage::new(left);
                         for (n, &page) in indices.iter().enumerate() {
                             if n.is_multiple_of(16) {
                                 control.check()?;
                             }
-                            let score = image_compare::gray_similarity_structure(
-                                &Algorithm::MSSIMSimple,
-                                left,
-                                &pages[page].gray,
-                            )
-                            .map(|s| s.score)
-                            .unwrap_or(0.0);
+                            let score = left.similarity(&content[page]);
                             row.consider(page, score);
                         }
                     }
@@ -304,10 +272,89 @@ fn score_frames(
     Ok(scores)
 }
 
+/// Blank areas cannot identify a page. Compare contrast/structure in 4×4
+/// tiles, weighted by the union of visible content in BOTH images. One-sided
+/// weighting lets a sparse template swallow dense pages. Capping tile weight
+/// keeps a high-contrast logo/QR code from outweighing the actual text.
+/// Means/variances are cached per PDF page and per resized video frame. No
+/// per-pair similarity map allocation or nested Rayon pool is needed.
+struct ContentImage {
+    tiles: Vec<ContentTile>,
+}
+
+struct ContentTile {
+    centered: [f32; 16],
+    energy: f32,
+    weight: f32,
+}
+
+impl ContentImage {
+    fn new(image: &GrayImage) -> Self {
+        let size = 4;
+        let mut tiles = Vec::new();
+        for y in (0..image.height()).step_by(size as usize) {
+            for x in (0..image.width()).step_by(size as usize) {
+                let mut centered = [0.0; 16];
+                let mut n = 0;
+                for dy in y..(y + size).min(image.height()) {
+                    for dx in x..(x + size).min(image.width()) {
+                        centered[n] = image.get_pixel(dx, dy)[0] as f32;
+                        n += 1;
+                    }
+                }
+                let mean = centered[..n].iter().sum::<f32>() / n as f32;
+                for value in &mut centered[..n] {
+                    *value -= mean;
+                }
+                let energy = centered.iter().map(|v| v * v).sum::<f32>();
+                // Suppress compression noise and smooth background gradients.
+                let weight = ((energy / n as f32).sqrt() - 4.0).clamp(0.0, 32.0);
+                tiles.push(ContentTile {
+                    centered,
+                    energy,
+                    weight,
+                });
+            }
+        }
+        Self { tiles }
+    }
+
+    fn similarity(&self, other: &Self) -> f64 {
+        let mut weighted = 0.0f64;
+        let mut total = 0.0f64;
+        for (left, right) in self.tiles.iter().zip(&other.tiles) {
+            let weight = left.weight.max(right.weight) as f64;
+            total += weight;
+            if left.weight == 0.0 || right.weight == 0.0 {
+                continue;
+            }
+            let covariance: f32 = left
+                .centered
+                .iter()
+                .zip(&right.centered)
+                .map(|(a, b)| a * b)
+                .sum();
+            // No luminance term: a cream recording of a white slide is valid.
+            // No positive constant: unrelated faint content is not evidence.
+            let structure = (2.0 * covariance / (left.energy + right.energy)).clamp(0.0, 1.0);
+            weighted += weight * structure as f64;
+        }
+        if total > 0.0 { weighted / total } else { 0.0 }
+    }
+}
+
 fn fit(image: &GrayImage, width: u32, height: u32) -> GrayImage {
     let (width, height) = (width.max(1), height.max(1));
     if image.width() == width && image.height() == height {
         return image.clone();
+    }
+    // Poppler rounds raster dimensions up; video aspect scaling rounds to the
+    // nearest pixel. Stretching 180 rows to 181 shifts and blurs every glyph.
+    // A one-pixel size discrepancy only needs border replication/cropping.
+    if image.width().abs_diff(width) <= 1 && image.height().abs_diff(height) <= 1 {
+        return GrayImage::from_fn(width, height, |x, y| {
+            *image.get_pixel(x.min(image.width() - 1), y.min(image.height() - 1))
+        });
     }
     image::imageops::resize(image, width, height, FilterType::Triangle)
 }
@@ -395,7 +442,7 @@ impl TextIndex {
         let score = if total_weight > 0.05 {
             (matched_weight / total_weight).min(1.0)
         } else {
-            0.5
+            0.0
         };
         matched.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         let keywords = matched
@@ -574,19 +621,30 @@ mod tests {
 
     fn frame(dir: &Path, t: f64, brightness: u8) -> FrameEvent {
         let image = format!("frame-{t}-{brightness}.png");
-        GrayImage::from_pixel(320, 180, image::Luma([brightness]))
-            .save(dir.join(&image))
-            .unwrap();
+        fixture_image(brightness).save(dir.join(&image)).unwrap();
         FrameEvent { t, image }
+    }
+
+    fn fixture_image(brightness: u8) -> GrayImage {
+        GrayImage::from_fn(320, 180, |x, y| {
+            image::Luma([
+                if brightness == 255
+                    && (20..220).contains(&x)
+                    && (20..50).contains(&y)
+                    && (x / 4 + y / 3) % 3 == 0
+                {
+                    0
+                } else {
+                    brightness
+                },
+            ])
+        })
     }
 
     #[test]
     fn unmatched_run_keeps_each_frame_and_its_subtitle_interval() {
         let dir = tempfile::tempdir().unwrap();
-        let pages = [page(
-            GrayImage::from_pixel(320, 180, image::Luma([255])),
-            "",
-        )];
+        let pages = [page(fixture_image(255), "")];
         // 白色 PDF → 三步暗色演示 → PDF；最后一张演示虽短也属于整个区间。
         let frames = vec![
             frame(dir.path(), 0.0, 255),
@@ -639,19 +697,13 @@ mod tests {
             assert_eq!(section.speech[0].text, word);
         }
         assert_eq!(sections[3].end, 8.0);
-        assert!(
-            spans[1].visual < spans[3].visual,
-            "each frame retains its own confidence"
-        );
+        assert!(spans[1..4].iter().all(|span| span.uncertain));
     }
 
     #[test]
     fn unmatched_tail_and_short_unmatched_clip_keep_all_frames() {
         let dir = tempfile::tempdir().unwrap();
-        let pages = [page(
-            GrayImage::from_pixel(320, 180, image::Luma([255])),
-            "",
-        )];
+        let pages = [page(fixture_image(255), "")];
         for (frames, end) in [
             (
                 vec![
@@ -687,12 +739,9 @@ mod tests {
     }
 
     #[test]
-    fn short_transition_merges_with_adjacent_pdf_without_moving_onset() {
+    fn short_unmatched_state_keeps_image_and_onset_between_pdf_visits() {
         let dir = tempfile::tempdir().unwrap();
-        let pages = [page(
-            GrayImage::from_pixel(320, 180, image::Luma([255])),
-            "",
-        )];
+        let pages = [page(fixture_image(255), "")];
         let frames = vec![
             frame(dir.path(), 0.0, 255),
             frame(dir.path(), 2.0, 0),
@@ -708,9 +757,15 @@ mod tests {
             &TaskControl::default(),
         )
         .unwrap();
-        assert_eq!(spans.len(), 1);
-        assert_eq!(spans[0].t, 0.0);
-        assert_eq!(spans[0].page, Some(0));
+        assert_eq!(spans.len(), 3);
+        assert_eq!(
+            spans.iter().map(|s| s.page).collect::<Vec<_>>(),
+            [Some(0), None, Some(0)]
+        );
+        assert_eq!(spans[1].image, frames[1].image);
+        assert_eq!(spans[1].t, 2.0);
+        assert!(spans[1].uncertain);
+        assert_eq!(spans[2].t, 3.0);
     }
 
     #[test]
@@ -742,13 +797,7 @@ mod tests {
                     let resized = fit(frame, p.gray.width(), p.gray.height());
                     (
                         i,
-                        image_compare::gray_similarity_structure(
-                            &Algorithm::MSSIMSimple,
-                            &resized,
-                            &p.gray,
-                        )
-                        .unwrap()
-                        .score,
+                        ContentImage::new(&resized).similarity(&ContentImage::new(&p.gray)),
                     )
                 })
                 .collect();
@@ -850,6 +899,240 @@ mod tests {
             .err()
             .unwrap();
         assert!(error.downcast_ref::<Failure>().is_some());
+    }
+
+    #[test]
+    fn confident_page_returns_survive_within_and_between_decks() {
+        let dir = tempfile::tempdir().unwrap();
+        let pages: Vec<_> = (0..3)
+            .map(|i| {
+                let gray = GrayImage::from_fn(320, 180, |x, y| {
+                    image::Luma([if ((x / 20 + y / 15 + i) % 3) == 0 {
+                        0
+                    } else {
+                        255
+                    }])
+                });
+                let mut p = page(gray, "");
+                p.deck = if i == 2 { 2 } else { 1 };
+                p.page = i + 1;
+                p.image = format!("slides/d{}-{}.png", p.deck, p.page);
+                p
+            })
+            .collect();
+        let sequence = [0, 1, 0, 2, 0, 2, 1];
+        let frames: Vec<_> = sequence
+            .iter()
+            .enumerate()
+            .map(|(i, &p)| {
+                let image = format!("frame-{i}.png");
+                pages[p].gray.save(dir.path().join(&image)).unwrap();
+                FrameEvent {
+                    t: i as f64 * 0.2,
+                    image,
+                }
+            })
+            .collect();
+        let spans = align(
+            dir.path(),
+            &frames,
+            &pages,
+            &[],
+            2.0,
+            0.6,
+            &TaskControl::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            spans.iter().map(|s| s.page).collect::<Vec<_>>(),
+            sequence.map(Some)
+        );
+        assert_eq!(
+            spans.iter().map(|s| s.t).collect::<Vec<_>>(),
+            frames.iter().map(|f| f.t).collect::<Vec<_>>()
+        );
+    }
+
+    fn title_image(title: &str, background: u8, qr: bool) -> GrayImage {
+        // Small bitmap text on an otherwise empty slide, with a shared QR-like
+        // template. Actual glyph shapes distinguish text from background.
+        let glyphs = [
+            ('A', [14, 17, 17, 31, 17, 17, 17]),
+            ('B', [30, 17, 17, 30, 17, 17, 30]),
+            ('C', [14, 17, 16, 16, 16, 17, 14]),
+            ('D', [30, 17, 17, 17, 17, 17, 30]),
+            ('E', [31, 16, 16, 30, 16, 16, 31]),
+            ('F', [31, 16, 16, 30, 16, 16, 16]),
+            ('G', [14, 17, 16, 23, 17, 17, 15]),
+            ('I', [31, 4, 4, 4, 4, 4, 31]),
+            ('K', [17, 18, 20, 24, 20, 18, 17]),
+            ('L', [16, 16, 16, 16, 16, 16, 31]),
+            ('M', [17, 27, 21, 21, 17, 17, 17]),
+            ('N', [17, 25, 25, 21, 19, 19, 17]),
+            ('O', [14, 17, 17, 17, 17, 17, 14]),
+            ('P', [30, 17, 17, 30, 16, 16, 16]),
+            ('R', [30, 17, 17, 30, 20, 18, 17]),
+            ('S', [15, 16, 16, 14, 1, 1, 30]),
+            ('T', [31, 4, 4, 4, 4, 4, 4]),
+            ('U', [17, 17, 17, 17, 17, 17, 14]),
+            ('Y', [17, 17, 10, 4, 4, 4, 4]),
+        ];
+        let mut image = GrayImage::from_pixel(320, 180, image::Luma([background]));
+        for (col, ch) in title.chars().enumerate() {
+            if let Some((_, rows)) = glyphs.iter().find(|(c, _)| *c == ch) {
+                for (row, bits) in rows.iter().enumerate() {
+                    for x in 0..5 {
+                        if bits & (1 << (4 - x)) != 0 {
+                            image.put_pixel(
+                                16 + col as u32 * 6 + x,
+                                16 + row as u32,
+                                image::Luma([20]),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if qr {
+            for y in 10..30 {
+                for x in 285..305 {
+                    if (x * 13 + y * 7) % 5 < 3 {
+                        image.put_pixel(x, y, image::Luma([0]));
+                    }
+                }
+            }
+        }
+        image
+    }
+
+    #[test]
+    fn blank_background_and_shared_template_do_not_identify_a_different_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrong = title_image("GROUPING BY MULTIPLE COLUMNS", 255, true);
+        for title in ["KINDS OF PROBLEMS", "SERIES", "SLIDO POLL"] {
+            let recorded = title_image(title, 245, true);
+            let legacy = image_compare::gray_similarity_structure(
+                &image_compare::Algorithm::MSSIMSimple,
+                &recorded,
+                &wrong,
+            )
+            .unwrap()
+            .score;
+            assert!(
+                legacy > 0.85,
+                "fixture must reproduce blank-background false confidence: {legacy}"
+            );
+            let image = "recorded.png".to_string();
+            recorded.save(dir.path().join(&image)).unwrap();
+            let frames = [FrameEvent {
+                t: 0.0,
+                image: image.clone(),
+            }];
+            let spans = align(
+                dir.path(),
+                &frames,
+                &[page(wrong.clone(), "")],
+                &[],
+                1.0,
+                0.6,
+                &TaskControl::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                spans[0].page, None,
+                "{title}, content score={}",
+                spans[0].visual
+            );
+            assert_eq!(spans[0].image, image);
+            assert!(spans[0].uncertain);
+            // The same title with a recording color cast remains a good match.
+            let correct = title_image(title, 255, true);
+            let score = ContentImage::new(&recorded).similarity(&ContentImage::new(&correct));
+            assert!(score > 0.95, "{title}: {score}");
+        }
+        let blank = GrayImage::from_pixel(320, 180, image::Luma([255]));
+        assert_eq!(
+            ContentImage::new(&blank).similarity(&ContentImage::new(&blank)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn pdf_dimension_rounding_and_partial_reveal_keep_content_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut full = title_image("GROUPING BY MULTIPLE COLUMNS", 255, false);
+        for column in 0..3 {
+            for y in 60..140 {
+                for x in (20 + column * 90)..(70 + column * 90) {
+                    if (x / 3 + y / 2) % 3 == 0 {
+                        full.put_pixel(x, y, image::Luma([20]));
+                    }
+                }
+            }
+        }
+        // Animated recording shows two columns; PDF contains the final three.
+        let mut partial = full.clone();
+        for y in 60..140 {
+            for x in 200..250 {
+                partial.put_pixel(x, y, image::Luma([255]));
+            }
+        }
+        let pages = [
+            page(fit(&full, 320, 181), ""),
+            page(title_image("SERIES", 255, false), ""),
+        ];
+        let image = "partial.png".to_string();
+        partial.save(dir.path().join(&image)).unwrap();
+        let frames = [FrameEvent { t: 0.0, image }];
+        let spans = align(
+            dir.path(),
+            &frames,
+            &pages,
+            &[],
+            2.0,
+            0.6,
+            &TaskControl::default(),
+        )
+        .unwrap();
+        assert_eq!(spans[0].page, Some(0));
+        let padded = fit(&partial, 320, 181);
+        for y in 0..180 {
+            for x in 0..320 {
+                assert_eq!(partial.get_pixel(x, y), padded.get_pixel(x, y));
+            }
+        }
+        assert_eq!(
+            ContentImage::new(&full).similarity(&ContentImage::new(&full)),
+            1.0
+        );
+    }
+
+    #[test]
+    fn unmatched_candidate_with_small_margin_is_always_uncertain() {
+        let dir = tempfile::tempdir().unwrap();
+        let gray = title_image("SERIES", 255, true);
+        gray.save(dir.path().join("recorded.png")).unwrap();
+        let frames = [FrameEvent {
+            t: 0.0,
+            image: "recorded.png".into(),
+        }];
+        let pages = [page(gray.clone(), "series"), page(gray, "series")];
+        let spans = align(
+            dir.path(),
+            &frames,
+            &pages,
+            &[],
+            1.0,
+            0.6,
+            &TaskControl::default(),
+        )
+        .unwrap();
+        assert!(spans[0].visual > 0.99);
+        assert_eq!(spans[0].page, None);
+        assert!(
+            spans[0].uncertain,
+            "ambiguous high score is still unverified"
+        );
     }
 
     #[test]

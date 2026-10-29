@@ -1526,6 +1526,78 @@ mod tests {
     }
 
     #[test]
+    fn alignment_review_survives_edit_and_rollback_and_invalid_reports_preserve_originals() {
+        let dir = tempfile::tempdir().unwrap();
+        rich_fixture(dir.path());
+        let report = serde_json::json!({
+            "schema": 1,
+            "pages": [{"t": 0.0, "image": "", "uncertain": true}],
+            "slides": ["/private/deck.pdf"]
+        });
+        let report_path = dir.path().join("alignment.json");
+        write_json(&report_path, &report).unwrap();
+        let original_report = std::fs::read(&report_path).unwrap();
+        apply_region_edit(dir.path(), 0, 0, "reviewed edit", None).unwrap();
+        let html = std::fs::read_to_string(dir.path().join("exports/course.html")).unwrap();
+        assert!(html.contains("class=\"page-review\""));
+        let json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dir.path().join("exports/structured.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["sections"][0]["needs_review"], true);
+        let mut zip = zip::ZipArchive::new(
+            std::fs::File::open(dir.path().join("exports/course.zip")).unwrap(),
+        )
+        .unwrap();
+        let mut portable_report = String::new();
+        zip.by_name("alignment.json")
+            .unwrap()
+            .read_to_string(&mut portable_report)
+            .unwrap();
+        assert!(!portable_report.contains("private"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&portable_report).unwrap()["pages"][0]["uncertain"],
+            true
+        );
+        drop(zip);
+        let before = snapshot(dir.path());
+        let original = std::fs::read(dir.path().join("document.json")).unwrap();
+        let mut document = load_document(dir.path()).unwrap();
+        document.sections[0].speech[0].text = "must roll back".into();
+        let stage = prepare(
+            dir.path(),
+            &serde_json::to_vec_pretty(&document).unwrap(),
+            &document,
+            Some(&original),
+        )
+        .unwrap();
+        assert!(
+            commit_with_hook(dir.path(), stage, |index| {
+                if index == 4 {
+                    anyhow::bail!("injected failure after exports");
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        assert_eq!(snapshot(dir.path()), before);
+        assert_eq!(std::fs::read(&report_path).unwrap(), original_report);
+        let mut stale = report;
+        stale["pages"][0]["t"] = 0.5.into();
+        for invalid in ["broken".to_owned(), stale.to_string()] {
+            std::fs::write(&report_path, invalid.as_bytes()).unwrap();
+            let error = apply_region_edit(dir.path(), 0, 0, "must not publish", None).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                crate::tr!("导出失败：PDF 页面核对信息无效或已过期，原笔记未修改。")
+            );
+            assert_eq!(snapshot(dir.path()), before);
+            assert_eq!(std::fs::read(&report_path).unwrap(), invalid.as_bytes());
+            assert!(!dir.path().join(JOURNAL).exists());
+        }
+    }
+
+    #[test]
     fn cancelled_preparation_does_not_publish_or_attempt_image_export() {
         let dir = tempfile::tempdir().unwrap();
         rich_fixture(dir.path());

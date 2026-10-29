@@ -464,11 +464,20 @@ fn publish_in_task(
         )?;
     }
     // 页对齐报告和成图一起发布，便于核对“这页讲的话”是否来自老师。
-    if work_dir.join("alignment.json").is_file() {
-        std::fs::copy(
-            work_dir.join("alignment.json"),
-            staging.path().join("alignment.json"),
-        )?;
+    let has_alignment = match std::fs::symlink_metadata(work_dir.join("alignment.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        result => {
+            result?;
+            true
+        }
+    };
+    if has_alignment {
+        let source = safe_asset_path(work_dir, "alignment.json")?;
+        anyhow::ensure!(
+            std::fs::metadata(&source)?.is_file(),
+            crate::tr!("PDF 页面的核对信息暂时无法读取，笔记正文仍可阅读。")
+        );
+        std::fs::copy(source, staging.path().join("alignment.json"))?;
     }
     let mut outputs = Vec::new();
     for format in formats {
@@ -501,6 +510,9 @@ fn publish_in_task(
     ];
     if staging.path().join("timeline.jsonl").is_file() {
         paths.push("timeline.jsonl".into());
+    }
+    if has_alignment {
+        paths.push("alignment.json".into());
     }
     paths.extend(copied);
     paths.extend(outputs.iter().cloned());
@@ -609,6 +621,92 @@ pub fn sync_dir(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::timeline::TranscriptEvent;
+
+    #[tokio::test]
+    async fn alignment_is_verified_and_its_hash_survives_note_edit_and_undo() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let report = br#"{"schema":1,"pages":[{"t":0.0,"image":"","uncertain":true}]}"#;
+        std::fs::write(work.join("alignment.json"), report).unwrap();
+        let target = Target {
+            task_id: "task".into(),
+            course_id: "course".into(),
+            source_id: "source".into(),
+            version_id: "v1".into(),
+            course_dir: root.path().join("course"),
+        };
+        let meta = VideoMeta {
+            title: "Reviewable note".into(),
+            uploader: String::new(),
+            duration: 1.,
+            webpage_url: String::new(),
+            extractor: "local".into(),
+            id: "source".into(),
+        };
+        let sections = vec![Section {
+            t: 0.,
+            end: 1.,
+            image: String::new(),
+            speech: vec![TranscriptEvent {
+                start: 0.,
+                end: 1.,
+                text: "original text".into(),
+                raw: None,
+                translation: None,
+            }],
+        }];
+        let manifest = publish(
+            &target,
+            &work,
+            &meta,
+            &sections,
+            None,
+            &[
+                crate::config::OutputFormat::Html,
+                crate::config::OutputFormat::Json,
+            ],
+            Outcomes::default(),
+            &TaskControl::default(),
+        )
+        .await
+        .unwrap();
+        let version = target.version_dir();
+        let asset = manifest
+            .assets
+            .iter()
+            .find(|asset| asset.path == "alignment.json")
+            .unwrap();
+        assert_eq!(asset.sha256, execution::digest(report));
+        assert_eq!(asset.bytes, report.len() as u64);
+        crate::note_edit::apply_region_edit(&version, 0, 0, "edited text", None).unwrap();
+        crate::note_edit::undo_in_place(&version).unwrap();
+        let edited_manifest = read_manifest(&version.join("manifest.json")).unwrap();
+        assert_eq!(
+            edited_manifest
+                .assets
+                .iter()
+                .find(|asset| asset.path == "alignment.json")
+                .unwrap()
+                .sha256,
+            asset.sha256
+        );
+        assert_eq!(
+            std::fs::read(version.join("alignment.json")).unwrap(),
+            report
+        );
+        validate_version(&version, &edited_manifest).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(version.join("exports/structured.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["sections"][0]["needs_review"], true);
+        std::fs::write(version.join("alignment.json"), b"corrupt").unwrap();
+        assert!(validate_version(&version, &edited_manifest).is_err());
+        std::fs::remove_file(version.join("alignment.json")).unwrap();
+        assert!(validate_version(&version, &edited_manifest).is_err());
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn interrupted_pointer_commit_recovers_once_and_preserves_edited_old_exports() {

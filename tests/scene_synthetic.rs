@@ -323,3 +323,482 @@ fn pdf_prepare_renders_text_and_pages_without_reusing_stale_outputs() {
             .starts_with(".slide-match-")
     }));
 }
+
+fn run_precise(video: &Path, root: &Path) -> Vec<course2md::timeline::FrameEvent> {
+    let cfg = course2md::config::PipelineConfig {
+        slide_mode: course2md::config::SlideMode::Precise,
+        ..test_cfg(video, root)
+    };
+    tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(course2md::scene::run(
+            &cfg,
+            video,
+            &course2md::execution::Job::detached(root.to_path_buf()),
+        ))
+        .unwrap()
+}
+
+/// Encode known source frames, optionally giving every frame a nonuniform PTS.
+/// ffprobe independently supplies the expected decoded timeline, not nominal FPS.
+fn encode_frames(
+    root: &Path,
+    frames: &[image::RgbImage],
+    pts: Option<&[f64]>,
+) -> std::path::PathBuf {
+    let inputs = root.join("input");
+    std::fs::create_dir_all(&inputs).unwrap();
+    for (i, image) in frames.iter().enumerate() {
+        image.save(inputs.join(format!("{i:04}.png"))).unwrap();
+    }
+    let video = root.join("source.mp4");
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args([
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-framerate",
+        "30",
+        "-i",
+    ])
+    .arg(inputs.join("%04d.png"));
+    if let Some(pts) = pts {
+        assert_eq!(frames.len(), pts.len());
+        let mut expression = "0".to_string();
+        for (i, t) in pts.iter().enumerate().rev() {
+            expression = format!(
+                "if(eq(N,{i}),{},{expression})",
+                (t * 90000.0).round() as i64
+            );
+        }
+        cmd.args(["-vf", &format!("settb=1/90000,setpts='{expression}'")]);
+    }
+    let output = cmd
+        .args([
+            "-fps_mode",
+            "passthrough",
+            "-enc_time_base",
+            "1/90000",
+            "-c:v",
+            "libx264",
+            "-crf",
+            "0",
+            "-pix_fmt",
+            "yuv420p",
+            "-video_track_timescale",
+            "90000",
+        ])
+        .arg(&video)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    video
+}
+
+fn decoded_pts(video: &Path) -> Vec<f64> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_entries",
+            "frame=best_effort_timestamp_time",
+            "-of",
+            "json",
+        ])
+        .arg(video)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    value["frames"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| {
+            f["best_effort_timestamp_time"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap()
+        })
+        .collect()
+}
+
+fn solid(value: u8) -> image::RgbImage {
+    image::RgbImage::from_pixel(480, 270, image::Rgb([value; 3]))
+}
+
+fn assert_frame_values(
+    root: &Path,
+    frames: &[course2md::timeline::FrameEvent],
+    times: &[f64],
+    values: &[u8],
+) {
+    assert_eq!(
+        frames.len(),
+        times.len(),
+        "events: {:?}",
+        frames.iter().map(|f| f.t).collect::<Vec<_>>()
+    );
+    for ((frame, expected_t), expected_value) in frames.iter().zip(times).zip(values) {
+        assert!(
+            (frame.t - expected_t).abs() < 0.000002,
+            "{} != {expected_t}",
+            frame.t
+        );
+        let image = image::open(root.join(&frame.image)).unwrap().to_luma8();
+        let value = image.get_pixel(100, 100).0[0];
+        assert!(
+            value.abs_diff(*expected_value) < 5,
+            "at {}: pixel {value}, expected {expected_value}",
+            frame.t
+        );
+    }
+}
+
+#[test]
+fn precise_keeps_single_frame_page_sequence_and_return_at_fractional_pts() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let values = [255, 0, 90, 180, 255];
+    let video = encode_frames(dir.path(), &values.map(solid), None);
+    let pts = decoded_pts(&video);
+    let frames = run_precise(&video, dir.path());
+    assert_frame_values(dir.path(), &frames, &pts, &values);
+}
+
+#[test]
+fn precise_vfr_uses_decoded_pts_including_a_sub_nominal_frame_flash() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let values = [255, 0, 90, 180, 255, 0, 90, 255];
+    let times = [0.0, 0.031, 0.032, 0.089, 0.410, 1.200, 1.201, 2.1];
+    let video = encode_frames(dir.path(), &values.map(solid), Some(&times));
+    let pts = decoded_pts(&video);
+    assert_eq!(pts.len(), times.len());
+    assert!(pts.windows(2).map(|p| p[1] - p[0]).any(|dt| dt < 0.002));
+    let frames = run_precise(&video, dir.path());
+    assert_frame_values(dir.path(), &frames, &pts, &values);
+}
+
+fn paint_box(image: &mut image::RgbImage, x: u32, y: u32, width: u32, height: u32) {
+    for py in y..(y + height).min(image.height()) {
+        for px in x..(x + width).min(image.width()) {
+            image.put_pixel(px, py, image::Rgb([0; 3]));
+        }
+    }
+}
+
+fn assert_image_matches(
+    root: &Path,
+    frame: &course2md::timeline::FrameEvent,
+    expected: &image::RgbImage,
+) {
+    let actual = image::open(root.join(&frame.image)).unwrap().to_rgb8();
+    assert_eq!(actual.dimensions(), expected.dimensions());
+    let error: f64 = actual
+        .as_raw()
+        .iter()
+        .zip(expected.as_raw())
+        .map(|(a, b)| f64::from(a.abs_diff(*b)))
+        .sum();
+    let mean = error / actual.as_raw().len() as f64;
+    assert!(
+        mean < 2.0,
+        "at {}: image differs from its timed state, mean error {mean}",
+        frame.t
+    );
+}
+
+#[test]
+fn precise_short_local_pages_and_board_growth_keep_each_state_onset() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    // Two-frame local changes (67 ms) never reach the 120 ms settling timer.
+    // These differ in less than 10% of the image, so full-screen cut detection
+    // alone cannot preserve them. A later return to the original page is real.
+    let base = solid(255);
+    let mut states = vec![base.clone()];
+    for x in [30, 170, 310] {
+        let mut state = base.clone();
+        paint_box(&mut state, x, 80, 100, 25);
+        states.push(state);
+    }
+    states.push(base.clone());
+    let mut growth = vec![base];
+    for i in 0..5 {
+        let mut state = growth.last().unwrap().clone();
+        paint_box(&mut state, 40, 40 + i * 30, 260, 10);
+        growth.push(state);
+    }
+    for (states, hold_frames) in [(states, 2), (growth, 15)] {
+        let dir = tempfile::tempdir().unwrap();
+        let source: Vec<_> = states
+            .iter()
+            .flat_map(|state| std::iter::repeat_n(state.clone(), hold_frames))
+            .collect();
+        let video = encode_frames(dir.path(), &source, None);
+        let pts = decoded_pts(&video);
+        let frames = run_precise(&video, dir.path());
+        assert_eq!(
+            frames.len(),
+            states.len(),
+            "events: {:?}",
+            frames.iter().map(|f| f.t).collect::<Vec<_>>()
+        );
+        for (i, (frame, state)) in frames.iter().zip(&states).enumerate() {
+            assert!((frame.t - pts[i * hold_frames]).abs() < 0.000002);
+            assert_image_matches(dir.path(), frame, state);
+        }
+    }
+}
+
+#[test]
+fn precise_continuous_code_scroll_keeps_bounded_snapshots_and_the_final_view() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let source: Vec<_> = (0..160)
+        .map(|n| {
+            let mut image = solid(255);
+            // Text-like rows continuously move upward, never settling.
+            for row in 0..12 {
+                let y = (row * 24 + 270 - (n * 2) % 270) % 270;
+                paint_box(&mut image, 30, y, 180 + (row % 4) * 40, 6);
+            }
+            image
+        })
+        .collect();
+    let video = encode_frames(dir.path(), &source, None);
+    let pts = decoded_pts(&video);
+    let frames = run_precise(&video, dir.path());
+    assert!(
+        (3..=5).contains(&frames.len()),
+        "continuous motion must be bounded: {frames:?}"
+    );
+    assert!(frames.windows(2).all(|pair| pair[1].t - pair[0].t <= 2.1));
+    for frame in &frames {
+        let index = pts
+            .iter()
+            .position(|t| (t - frame.t).abs() < 0.000002)
+            .expect("snapshot onset is a decoded frame PTS");
+        assert_image_matches(dir.path(), frame, &source[index]);
+    }
+    let last = frames.last().unwrap();
+    assert!(
+        (last.t - pts.last().unwrap()).abs() < 0.000002,
+        "the final viewport must not be replaced by an earlier peak"
+    );
+    assert_image_matches(dir.path(), last, source.last().unwrap());
+}
+
+#[test]
+fn precise_normalizes_nonzero_container_start_consistently_with_seeking() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let values = [255, 0, 90, 255];
+    let video = encode_frames(
+        dir.path(),
+        &values.map(solid),
+        Some(&[0.0, 0.037, 0.062, 0.4]),
+    );
+    let shifted = dir.path().join("shifted.mp4");
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+        .arg(&video)
+        .args(["-c", "copy", "-output_ts_offset", "7.0"])
+        .arg(&shifted)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let absolute_pts = decoded_pts(&shifted);
+    assert!((absolute_pts[0] - 7.0).abs() < 0.000002);
+    let relative: Vec<_> = absolute_pts.iter().map(|t| t - absolute_pts[0]).collect();
+    let frames = run_precise(&shifted, dir.path());
+    assert_frame_values(dir.path(), &frames, &relative, &values);
+}
+
+#[test]
+fn every_scan_mode_and_capture_use_the_probed_first_video_stream() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let video = dir.path().join("dual.mkv");
+    let output = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=red:s=160x90:r=2:d=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=blue:s=320x180:r=2:d=1",
+            "-map",
+            "0:v:0",
+            "-map",
+            "1:v:0",
+            "-c:v",
+            "ffv1",
+            "-disposition:v:0",
+            "0",
+            "-disposition:v:1",
+            "0",
+        ])
+        .arg(&video)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let info = runtime
+        .block_on(course2md::media::probe_video(&video))
+        .unwrap();
+    assert_eq!((info.width, info.height), (160, 90));
+    for mode in [
+        course2md::config::SlideMode::First,
+        course2md::config::SlideMode::Stable,
+        course2md::config::SlideMode::Precise,
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let cfg = course2md::config::PipelineConfig {
+            slide_mode: mode,
+            ..test_cfg(&video, work.path())
+        };
+        let frames = runtime
+            .block_on(course2md::scene::run(
+                &cfg,
+                &video,
+                &course2md::execution::Job::detached(work.path().to_path_buf()),
+            ))
+            .unwrap();
+        assert!(!frames.is_empty());
+        for frame in frames {
+            let image = image::open(work.path().join(frame.image))
+                .unwrap()
+                .to_rgb8();
+            assert_eq!(image.dimensions(), (160, 90));
+            let pixel = image.get_pixel(80, 45).0;
+            assert!(
+                pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10,
+                "{mode:?}: {pixel:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn precise_accepts_filter_reinitialization_with_continuous_pts() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let mut bytes = Vec::new();
+    for (i, size) in ["160x90", "320x180"].iter().enumerate() {
+        let segment = dir.path().join(format!("segment-{i}.ts"));
+        let output = Command::new("ffmpeg")
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("color=red:s={size}:r=2:d=1"),
+                "-c:v",
+                "libx264",
+                "-bf",
+                "0",
+                "-f",
+                "mpegts",
+            ])
+            .arg(&segment)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        bytes.extend(std::fs::read(segment).unwrap());
+    }
+    let video = dir.path().join("changed.ts");
+    std::fs::write(&video, bytes).unwrap();
+    // Check the reproduction itself: two filter generations, each starting n=0.
+    let output = Command::new("ffmpeg")
+        .args(["-hide_banner", "-nostats", "-loglevel", "info", "-an", "-i"])
+        .arg(&video)
+        .args([
+            "-map",
+            "0:v:0",
+            "-vf",
+            "scale=480:270,format=rgb24,showinfo=checksum=0",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "null",
+            "-",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("config in time_base:").count(),
+        2,
+        "{stderr}"
+    );
+    let local: Vec<_> = stderr
+        .lines()
+        .filter_map(|line| {
+            line.split_once(" n:")
+                .map(|(_, tail)| tail.split_whitespace().next().unwrap())
+        })
+        .collect();
+    assert_eq!(local, ["0", "1", "0", "1"]);
+    let frames = run_precise(&video, dir.path());
+    assert_eq!(frames.len(), 1, "same red slide survives resolution change");
+    assert_eq!(frames[0].t, 0.0);
+    let pixel = image::open(dir.path().join(&frames[0].image))
+        .unwrap()
+        .to_rgb8()
+        .get_pixel(20, 20)
+        .0;
+    assert!(
+        pixel[0] > 240 && pixel[1] < 10 && pixel[2] < 10,
+        "{pixel:?}"
+    );
+}

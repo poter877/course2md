@@ -242,7 +242,19 @@ pub(crate) fn write_html<W: Write>(
     sections: &[Section],
     summary: Option<&crate::summarize::Summary>,
     body: &mut W,
+    image_target: impl FnMut(&mut W, &str) -> Result<()>,
+) -> Result<()> {
+    write_html_with_reviews(meta, sections, summary, body, image_target, &[])
+}
+
+/// Export-only review annotations stay outside the transcript and document schema.
+pub(crate) fn write_html_with_reviews<W: Write>(
+    meta: &VideoMeta,
+    sections: &[Section],
+    summary: Option<&crate::summarize::Summary>,
+    body: &mut W,
     mut image_target: impl FnMut(&mut W, &str) -> Result<()>,
+    needs_review: &[bool],
 ) -> Result<()> {
     write!(
         body,
@@ -281,7 +293,7 @@ pub(crate) fn write_html<W: Write>(
         body.write_all(crate::summarize::render_html_block(summary).as_bytes())?;
         writeln!(body)?;
     }
-    for s in sections {
+    for (index, s) in sections.iter().enumerate() {
         write!(body, "<section id=\"t{}\"><h2>", s.t.floor() as u64)?;
         if let Some(label) = image_label(&s.image) {
             write!(body, "{} · ", esc(&label))?;
@@ -297,6 +309,13 @@ pub(crate) fn write_html<W: Write>(
             )?;
         }
         body.write_all(b"</h2>\n")?;
+        if needs_review.get(index).copied().unwrap_or(false) {
+            writeln!(
+                body,
+                "<p class=\"page-review\" role=\"note\">{}</p>",
+                esc(crate::tr!("PDF 页面待核对，请对照原视频确认。"))
+            )?;
+        }
         if !s.image.is_empty() {
             let tag = if let Some(label) = image_label(&s.image) {
                 format!("<img loading=\"lazy\" src=\"\" alt=\"{}\">", esc(&label))

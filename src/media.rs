@@ -65,7 +65,7 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub duration: f64,
-    /// 标称帧率；逐帧模式用它把帧序号换算成时间。探测不到时为 30。
+    /// 标称帧率，仅用于进度估计；精确扫描使用解码帧 PTS。探测不到时为 30。
     pub fps: f64,
 }
 
@@ -97,7 +97,7 @@ fn parse_rate(raw: Option<&str>) -> Option<f64> {
     let (num, den) = raw?.split_once('/')?;
     let num: f64 = num.trim().parse().ok()?;
     let den: f64 = den.trim().parse().ok()?;
-    (num > 0.0 && den > 0.0).then(|| num / den)
+    (num.is_finite() && den.is_finite() && num > 0.0 && den > 0.0).then(|| num / den)
 }
 
 /// 视频宽高、时长与标称帧率。用 `-of json` 结构化输出，取代按逗号/空白切分的文本解析。
@@ -182,4 +182,140 @@ pub fn probe_duration_blocking(media: &Path) -> Option<f64> {
         .success()
         .then(|| parse_duration_text(&out.stdout))
         .flatten()
+}
+
+/// Paired with the raw frame emitted by the same ffmpeg filter graph. Reading
+/// integer PTS avoids showinfo's rounded pts_time (notably in long lectures).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct FrameStamp {
+    pub generation: u64,
+    pub index: u64,
+    pub seconds: f64,
+}
+
+#[derive(Default)]
+pub(crate) struct FrameClock {
+    time_base: Option<(f64, f64)>,
+    generation: u64,
+}
+
+impl FrameClock {
+    pub fn parse(&mut self, line: &str) -> Result<Option<FrameStamp>> {
+        if !line.contains("Parsed_showinfo_") {
+            return Ok(None);
+        }
+        if let Some((_, value)) = line.split_once("config in time_base:") {
+            let value = value.split(',').next().unwrap_or("").trim();
+            let valid = value.split_once('/').and_then(|(n, d)| {
+                let (n, d) = (n.parse::<f64>().ok()?, d.parse::<f64>().ok()?);
+                (n.is_finite() && d.is_finite() && n > 0.0 && d > 0.0).then_some((n, d))
+            });
+            anyhow::ensure!(
+                valid.is_some(),
+                crate::tr!("视频帧时间戳缺失或无效，无法可靠定位截图")
+            );
+            // A resolution/pixel-format change reinitializes the filter graph:
+            // showinfo's local n resets, but the source PTS must stay continuous.
+            if self.time_base.is_some() {
+                self.generation += 1;
+            }
+            self.time_base = valid;
+            return Ok(None);
+        }
+        let Some((_, count)) = line.split_once(" n:") else {
+            return Ok(None);
+        };
+        let stamp = (|| {
+            let index = count.split_whitespace().next()?.parse::<u64>().ok()?;
+            let pts = line
+                .split_once(" pts:")?
+                .1
+                .split_whitespace()
+                .next()?
+                .parse::<i64>()
+                .ok()?;
+            let (n, d) = self.time_base?;
+            let seconds = pts as f64 * n / d;
+            (seconds.is_finite() && seconds >= 0.0).then_some(FrameStamp {
+                generation: self.generation,
+                index,
+                seconds,
+            })
+        })();
+        stamp
+            .map(Some)
+            .context(crate::tr!("视频帧时间戳缺失或无效，无法可靠定位截图"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoded_clock_tracks_filter_generations_and_new_time_bases() {
+        let mut clock = FrameClock::default();
+        let mut stamps = Vec::new();
+        for (base, counts) in [("1/10", [0, 5]), ("1/100", [100, 150])] {
+            clock
+                .parse(&format!(
+                    "[Parsed_showinfo_2 @ ptr] config in time_base: {base}, frame_rate: 2/1"
+                ))
+                .unwrap();
+            for (n, pts) in counts.iter().enumerate() {
+                stamps.push(
+                    clock
+                        .parse(&format!(
+                            "[Parsed_showinfo_2 @ ptr] n: {n} pts:{pts} pts_time:unused"
+                        ))
+                        .unwrap()
+                        .unwrap(),
+                );
+            }
+        }
+        assert_eq!(
+            stamps
+                .iter()
+                .map(|s| (s.generation, s.index))
+                .collect::<Vec<_>>(),
+            [(0, 0), (0, 1), (1, 0), (1, 1)]
+        );
+        assert_eq!(
+            stamps.iter().map(|s| s.seconds).collect::<Vec<_>>(),
+            [0.0, 0.5, 1.0, 1.5]
+        );
+    }
+
+    #[test]
+    fn decoded_clock_keeps_long_lecture_precision_and_rejects_missing_pts() {
+        let mut clock = FrameClock::default();
+        assert_eq!(
+            clock
+                .parse("[Parsed_showinfo_2 @ ptr] config in time_base: 1/90000, frame_rate: 30/1")
+                .unwrap(),
+            None
+        );
+        let stamp = clock
+            .parse("[Parsed_showinfo_2 @ ptr] n: 99 pts:648003003 pts_time:7200.03 fmt:rgb24")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stamp.index, 99);
+        assert!((stamp.seconds - 7200.033366666667).abs() < 1e-10);
+        assert!(
+            clock
+                .parse("[Parsed_showinfo_2 @ ptr] n: 100 pts: NOPTS pts_time:NOPTS")
+                .is_err()
+        );
+        assert!(
+            FrameClock::default()
+                .parse("[Parsed_showinfo_2 @ ptr] n: 0 pts:0 pts_time:0")
+                .is_err()
+        );
+        assert!(
+            clock
+                .parse("[Parsed_showinfo_2 @ ptr] config in time_base: 0/0, frame_rate: 30/1")
+                .is_err()
+        );
+        assert_eq!(clock.parse("encoder diagnostic").unwrap(), None);
+    }
 }

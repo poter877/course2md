@@ -12,7 +12,7 @@ use image::GrayImage;
 use image_compare::Algorithm;
 use std::borrow::Cow;
 use std::path::Path;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 
 /// SSIM 采样宽度：足够区分版面变化，同时控制 rawvideo 带宽与 SSIM 计算开销
@@ -51,14 +51,16 @@ async fn extract_frame(
     control: &crate::dispatch::TaskControl,
 ) -> Result<()> {
     control.check()?;
-    let ss = format!("{t:.3}");
+    // ffmpeg seek timestamps have microsecond precision. Round down, never up:
+    // rounding 2/30 to .067 seeks past that one-frame page and captures the next.
+    let ss = format!("{:.6}", (t * 1_000_000.0).floor() / 1_000_000.0);
     // -q:v 2：JPEG 高质量档（2~31，越小越好），讲义文字可读性优先
     let mut cmd = Command::new(crate::tools::program("ffmpeg"));
     cmd.kill_on_drop(true)
         .args(["-hide_banner", "-loglevel", "error", "-y", "-ss", &ss])
         .arg("-i")
         .arg(media)
-        .args(["-frames:v", "1", "-q:v", "2"])
+        .args(["-map", "0:v:0", "-frames:v", "1", "-q:v", "2"])
         .arg(dest);
     let output = tokio::select! {
         error = control.watch() => return Err(error),
@@ -108,6 +110,10 @@ const SCAN_MOTION_AREA: f64 = 0.0006;
 const SCAN_SETTLE_SECS: f64 = 0.12;
 /// 连续变化超过多久强制保留一帧（老师一直写、动画持续时也不会丢过程帧）。
 const SCAN_MAX_HOLD_SECS: f64 = 2.0;
+/// A large abrupt cut is distinct even if the outgoing page lasted one frame.
+/// Smaller continuous motion remains throttled; brief static runs are flushed
+/// separately when the next change arrives.
+const SCAN_CUT_AREA: f64 = 0.30;
 
 /// 降采样后的 RGB 签名；ROI 在缩放后裁剪。
 #[derive(Clone)]
@@ -214,7 +220,9 @@ fn make_scan_sig(rgb: &[u8], w: u32, h: u32, roi: Option<Roi>) -> ScanSig {
 struct PreciseDetector {
     reference: Option<ScanSig>,
     previous: Option<ScanSig>,
-    peak: Option<(f64, ScanSig)>,
+    previous_t: f64,
+    state_start: f64,
+    peak: Option<f64>,
     peak_score: f64,
     diverging: bool,
     diverge_start: f64,
@@ -228,6 +236,8 @@ impl PreciseDetector {
         Self {
             reference: None,
             previous: None,
+            previous_t: 0.0,
+            state_start: 0.0,
             peak: None,
             peak_score: f64::NEG_INFINITY,
             diverging: false,
@@ -239,24 +249,44 @@ impl PreciseDetector {
     }
 
     fn push(&mut self, t: f64, sig: ScanSig) {
-        let Some(reference) = self.reference.as_ref() else {
+        if self.reference.is_none() {
             // 首帧总是第一张截图。
             self.times.push((t, t));
             self.last_emit = t;
             self.reference = Some(sig.clone());
             self.previous = Some(sig);
+            self.previous_t = t;
             return;
-        };
-        let d_ref = scan_diff(reference, &sig);
+        }
+        let mut d_ref = scan_diff(self.reference.as_ref().unwrap(), &sig);
         let d_prev = self
             .previous
             .as_ref()
             .map(|p| scan_diff(p, &sig))
             .unwrap_or_default();
+        // A short page can end before the settling timer fires. Keep its
+        // actual state before replacing the candidate with the next page.
+        // With VFR, one decoded frame may itself have been displayed for seconds.
+        if self.diverging
+            && d_ref.changed()
+            && d_prev.changed()
+            && (self.stable_since.is_some()
+                || t - self.previous_t >= SCAN_SETTLE_SECS
+                || d_prev.area >= SCAN_CUT_AREA)
+        {
+            let capture = self.stable_since.unwrap_or(self.previous_t);
+            if capture > self.last_emit {
+                self.emit(self.state_start, capture);
+                self.reference = self.previous.clone();
+                self.reset_divergence();
+                d_ref = scan_diff(self.reference.as_ref().unwrap(), &sig);
+            }
+        }
         if d_ref.changed() {
             if !self.diverging {
                 self.diverging = true;
                 self.diverge_start = t;
+                self.state_start = t;
                 self.peak = None;
                 self.peak_score = f64::NEG_INFINITY;
                 self.stable_since = None;
@@ -264,28 +294,31 @@ impl PreciseDetector {
             let score = d_ref.score();
             if score > self.peak_score {
                 self.peak_score = score;
-                self.peak = Some((t, sig.clone()));
+                self.peak = Some(t);
             }
             if d_prev.moving() {
+                self.state_start = t;
                 self.stable_since = None;
             } else {
-                let since = *self.stable_since.get_or_insert(t);
+                let since = *self.stable_since.get_or_insert(self.previous_t);
                 if t - since >= SCAN_SETTLE_SECS && t > self.last_emit {
-                    self.emit(self.diverge_start, t);
+                    self.emit(self.state_start, t);
                     self.reference = Some(sig.clone());
                     self.reset_divergence();
                 }
             }
             if self.diverging && t - self.diverge_start >= SCAN_MAX_HOLD_SECS && t > self.last_emit
             {
-                self.emit(self.diverge_start, t);
+                // Process snapshots describe the state at capture, not what was
+                // on screen two seconds earlier when motion first began.
+                self.emit(t, t);
                 self.reference = Some(sig.clone());
                 self.reset_divergence();
             }
         } else if self.diverging {
             // 偏离后又回到原状态：闪现和恢复都是时间线事件。
             // 只留峰值会让后续字幕一直归到已经消失的闪现画面。
-            if let Some((peak_t, _)) = self.peak.take()
+            if let Some(peak_t) = self.peak.take()
                 && peak_t > self.last_emit
             {
                 self.emit(self.diverge_start, peak_t);
@@ -294,15 +327,15 @@ impl PreciseDetector {
             self.reset_divergence();
         }
         self.previous = Some(sig);
+        self.previous_t = t;
     }
 
-    /// 视频结束：还没收尾的偏离期用峰值帧补发，避免尾页丢失。
+    /// Keep the final visible state, even when an earlier scrolling frame had
+    /// the largest difference. Its onset is the last material motion boundary.
     fn finish(&mut self) {
-        if self.diverging
-            && let Some((peak_t, _)) = self.peak.take()
-            && peak_t > self.last_emit
-        {
-            self.emit(self.diverge_start, peak_t);
+        if self.diverging && self.previous_t > self.last_emit {
+            self.emit(self.state_start, self.previous_t);
+            self.reset_divergence();
         }
     }
 
@@ -318,6 +351,20 @@ impl PreciseDetector {
     }
 }
 
+fn valid_next_stamp(previous: Option<media::FrameStamp>, stamp: media::FrameStamp) -> bool {
+    match previous {
+        None => stamp.index == 0,
+        Some(prev) => {
+            let sequential = if stamp.generation == prev.generation {
+                stamp.index == prev.index + 1
+            } else {
+                stamp.generation > prev.generation && stamp.index == 0
+            };
+            sequential && stamp.seconds > prev.seconds
+        }
+    }
+}
+
 /// 逐帧扫描：每个解码帧都做分块差异判断，输出要截图的 (onset, capture) 时间点。
 async fn sample_precise(
     cfg: &PipelineConfig,
@@ -327,7 +374,9 @@ async fn sample_precise(
 ) -> Result<Vec<(f64, f64)>> {
     let (tw, th) = scaled_wh(info.width, info.height, SCAN_WIDTH);
     let fps = info.fps;
-    let vf = format!("fps={fps:.6},scale={tw}:{th},format=rgb24");
+    // No fps filter: it resamples VFR and can discard short pages. PTS and pixels
+    // come from the same graph; passthrough also prevents output-side duplication.
+    let vf = format!("scale={tw}:{th},format=rgb24,showinfo=checksum=0");
     tracing::info!(
         w = info.width,
         h = info.height,
@@ -338,10 +387,20 @@ async fn sample_precise(
 
     let mut child = Command::new(crate::tools::program("ffmpeg"))
         .kill_on_drop(true)
-        .args(["-hide_banner", "-loglevel", "error", "-an"])
+        .args(["-hide_banner", "-nostats", "-loglevel", "info", "-an"])
         .arg("-i")
         .arg(media)
-        .args(["-vf", &vf, "-f", "rawvideo", "pipe:1"])
+        .args([
+            "-map",
+            "0:v:0",
+            "-vf",
+            &vf,
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "pipe:1",
+        ])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -349,11 +408,25 @@ async fn sample_precise(
             "无法读取视频画面 / Could not start ffmpeg frame sampling"
         ))?;
     let mut stdout = child.stdout.take().context("ffmpeg stdout")?;
-    let mut stderr = child.stderr.take().context("ffmpeg stderr")?;
+    let stderr = child.stderr.take().context("ffmpeg stderr")?;
+    let (stamps_tx, mut stamps_rx) = tokio::sync::mpsc::channel(16);
     let stderr_task = tokio::spawn(async move {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf).await;
-        buf
+        let mut lines = BufReader::new(stderr).lines();
+        let mut clock = media::FrameClock::default();
+        let mut tail = std::collections::VecDeque::new();
+        while let Some(line) = lines.next_line().await? {
+            if let Some(stamp) = clock.parse(&line)? {
+                if stamps_tx.send(stamp).await.is_err() {
+                    break;
+                }
+            } else if !line.contains("Parsed_showinfo_") {
+                if tail.len() == 8 {
+                    tail.pop_front();
+                }
+                tail.push_back(line);
+            }
+        }
+        Ok::<_, anyhow::Error>(tail.into_iter().collect::<Vec<_>>().join("\n"))
     });
 
     let frame_len = (tw as usize) * (th as usize) * 3;
@@ -365,6 +438,7 @@ async fn sample_precise(
 
     let mut detector = PreciseDetector::new();
     let mut i: u64 = 0;
+    let mut previous_stamp: Option<media::FrameStamp> = None;
     loop {
         control.check()?;
         let read = tokio::select! {
@@ -376,7 +450,16 @@ async fn sample_precise(
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
-        let t = i as f64 / fps;
+        let stamp = tokio::select! {
+            error = control.watch() => return Err(error),
+            stamp = stamps_rx.recv() => stamp.context(crate::tr!("视频帧时间戳缺失或无效，无法可靠定位截图"))?,
+        };
+        anyhow::ensure!(
+            valid_next_stamp(previous_stamp, stamp),
+            crate::tr!("视频帧时间戳缺失或无效，无法可靠定位截图")
+        );
+        let t = stamp.seconds;
+        previous_stamp = Some(stamp);
         i += 1;
         pb.inc(1);
         let sig = make_scan_sig(&buf, tw, th, cfg.roi);
@@ -395,9 +478,8 @@ async fn sample_precise(
         error = control.watch() => return Err(error),
         status = child.wait() => status?,
     };
-    let stderr_bytes = stderr_task.await.unwrap_or_default();
+    let tail = stderr_task.await??;
     if !status.success() {
-        let tail = crate::error::tail_lines(&String::from_utf8_lossy(&stderr_bytes), 5);
         anyhow::bail!(crate::tr!(
             "外部工具 {} 执行失败（退出码 {}）：{}",
             "ffmpeg",
@@ -405,6 +487,10 @@ async fn sample_precise(
             tail
         ));
     }
+    anyhow::ensure!(
+        stamps_rx.try_recv().is_err(),
+        crate::tr!("视频帧时间戳缺失或无效，无法可靠定位截图")
+    );
     pb.finish();
     tracing::info!(
         slides = detector.times.len(),
@@ -420,9 +506,11 @@ async fn sample_timestamps(
     media: &Path,
     control: &crate::dispatch::TaskControl,
 ) -> Result<Vec<(f64, f64)>> {
-    let info = media::probe_video(media)
-        .await
-        .context(crate::tr!("无法读取视频尺寸，请检查文件是否可播放 / Could not read video dimensions; check that the file plays correctly"))?;
+    control.check()?;
+    let info = tokio::select! {
+        error = control.watch() => return Err(error),
+        info = media::probe_video(media) => info,
+    }.context(crate::tr!("无法读取视频尺寸，请检查文件是否可播放 / Could not read video dimensions; check that the file plays correctly"))?;
     if cfg.slide_mode == crate::config::SlideMode::Precise {
         return sample_precise(cfg, media, control, &info).await;
     }
@@ -446,7 +534,7 @@ async fn sample_timestamps(
         .args(["-hide_banner", "-loglevel", "error", "-an"])
         .arg("-i")
         .arg(media)
-        .args(["-vf", &vf, "-f", "rawvideo", "pipe:1"])
+        .args(["-map", "0:v:0", "-vf", &vf, "-f", "rawvideo", "pipe:1"])
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -694,6 +782,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn filter_generation_resets_only_local_count_not_pts_order() {
+        let stamp = |generation, index, seconds| media::FrameStamp {
+            generation,
+            index,
+            seconds,
+        };
+        assert!(valid_next_stamp(None, stamp(0, 0, 0.0)));
+        assert!(valid_next_stamp(Some(stamp(0, 0, 0.0)), stamp(0, 1, 0.5)));
+        assert!(valid_next_stamp(Some(stamp(0, 1, 0.5)), stamp(1, 0, 1.0)));
+        assert!(!valid_next_stamp(Some(stamp(0, 1, 0.5)), stamp(0, 0, 1.0)));
+        assert!(!valid_next_stamp(Some(stamp(0, 1, 0.5)), stamp(1, 1, 1.0)));
+        assert!(!valid_next_stamp(Some(stamp(0, 1, 0.5)), stamp(1, 0, 0.5)));
+        assert!(!valid_next_stamp(Some(stamp(0, 1, 0.5)), stamp(1, 0, 0.0)));
+    }
+
+    #[test]
     fn scale_keeps_even_height() {
         let (w, h) = scaled_wh(1280, 410, 640);
         assert_eq!(w, 640);
@@ -816,7 +920,7 @@ mod tests {
     }
 
     #[test]
-    fn flash_and_unfinished_tail_keep_onset_separate_from_peak_capture() {
+    fn flash_keeps_onset_and_unfinished_tail_keeps_final_state() {
         let base = white(80, 40);
         let mut small = base.clone();
         paint(&mut small, 10, 10, 10, 10, 0);
@@ -831,10 +935,10 @@ mod tests {
                 detector.push(1.06, base.clone());
             }
             detector.finish();
-            assert_eq!(detector.times[1], (1.0, 1.03));
             if restore {
                 assert_eq!(detector.times, [(0.0, 0.0), (1.0, 1.03), (1.06, 1.06)]);
             } else {
+                assert_eq!(detector.times[1], (1.03, 1.03));
                 assert_eq!(detector.times.len(), 2);
             }
         }

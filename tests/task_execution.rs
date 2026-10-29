@@ -93,6 +93,56 @@ fn run(root: &Path, request: &Request) -> Output {
 }
 
 #[test]
+fn resumed_task_rebuilds_legacy_screenshots_even_when_image_hashes_match() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("lecture.mp4");
+    common::fixture_video(&video, 2);
+    let mut request = request(root.path(), &video);
+    request.duration = 2.0;
+    request.config.defaults.model_dir = Some(root.path().join("models"));
+    let binding = request.binding(&request.resolve().unwrap()).unwrap();
+    course2md::execution::bind_work_dir(&request.work_dir, &binding).unwrap();
+    let image = request.work_dir.join("legacy.jpg");
+    image::RgbImage::from_pixel(32, 32, image::Rgb([255, 0, 0]))
+        .save(&image)
+        .unwrap();
+    let digest = course2md::execution::file_digest(&image).unwrap();
+    // An intact legacy checkpoint can still carry the old frame-number/fps
+    // timestamp bug. Integrity alone must not authorize reusing that timeline.
+    let cache = serde_json::json!({
+        "frames": [{"t": 99.0, "image": "legacy.jpg"}],
+        "files": [["legacy.jpg", digest]],
+    });
+    let checkpoint = request.work_dir.join("screenshots.json");
+    std::fs::write(&checkpoint, serde_json::to_vec(&cache).unwrap()).unwrap();
+    let output = run(root.path(), &request);
+    assert!(output.status.success(), "{:?}", events(&output));
+    let rebuilt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(checkpoint).unwrap()).unwrap();
+    assert!(rebuilt["scan_revision"].as_u64().unwrap() > 0);
+    let frames = rebuilt["frames"].as_array().unwrap();
+    assert!(!frames.is_empty());
+    assert!(
+        frames
+            .iter()
+            .all(|frame| frame["t"].as_f64().unwrap() < 2.0)
+    );
+    let version = request.course_dir.join("versions/version-one");
+    let document: artifact::Document =
+        serde_json::from_slice(&std::fs::read(version.join("document.json")).unwrap()).unwrap();
+    assert!(
+        document
+            .sections
+            .iter()
+            .all(|section| section.image != "legacy.jpg")
+    );
+    assert_eq!(course2md::execution::file_digest(&image).unwrap(), digest);
+}
+
+#[test]
 fn cli_attached_utf16_subtitles_skip_asr_and_same_path_edits_make_a_new_note() {
     if !common::ffmpeg_available() {
         return;

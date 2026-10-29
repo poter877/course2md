@@ -81,6 +81,99 @@ struct PortableSection<'a> {
     end: f64,
     image_id: Option<&'a str>,
     speech: &'a [crate::timeline::TranscriptEvent],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    needs_review: Option<bool>,
+}
+
+/// Only portable review information is retained. The source report also contains
+/// local PDF paths and diagnostic scores, which must not leak into shared exports.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct AlignmentReport {
+    schema: u32,
+    pages: Vec<AlignmentPage>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct AlignmentPage {
+    t: f64,
+    image: String,
+    uncertain: bool,
+}
+
+struct PageReviews {
+    alignment: AlignmentReport,
+    sections: Vec<bool>,
+}
+
+fn page_reviews(
+    root: &Path,
+    document: &Document,
+    images: &BTreeMap<String, ImageAsset>,
+    control: &TaskControl,
+) -> Result<Option<PageReviews>> {
+    control.check()?;
+    match std::fs::symlink_metadata(root.join("alignment.json")) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        result => {
+            result?;
+        }
+    }
+    let read = || -> Result<PageReviews> {
+        const MAX_REPORT_BYTES: u64 = 16 * 1024 * 1024;
+        control.check()?;
+        let path = artifact::safe_asset_path(root, "alignment.json")?.canonicalize()?;
+        anyhow::ensure!(
+            std::fs::metadata(&path)?.is_file(),
+            "invalid alignment file"
+        );
+        let file = ControlledIo::new(File::open(path)?, control);
+        let mut bytes = Vec::new();
+        file.take(MAX_REPORT_BYTES + 1).read_to_end(&mut bytes)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= MAX_REPORT_BYTES,
+            "alignment file too large"
+        );
+        let mut alignment: AlignmentReport = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(alignment.schema == 1, "unsupported alignment schema");
+        let mut positions = BTreeMap::<_, Vec<_>>::new();
+        for (index, section) in document.sections.iter().enumerate() {
+            positions
+                .entry((section.t.to_bits(), section.image.as_str()))
+                .or_default()
+                .push(index);
+        }
+        let mut sections = vec![false; document.sections.len()];
+        for page in &mut alignment.pages {
+            control.check()?;
+            anyhow::ensure!(
+                page.t.is_finite() && page.t >= 0.0,
+                "invalid alignment time"
+            );
+            let matches = positions.get(&(page.t.to_bits(), page.image.as_str()));
+            let Some([index]) = matches.map(Vec::as_slice) else {
+                anyhow::bail!("alignment does not match note sections");
+            };
+            sections[*index] |= page.uncertain;
+            if !page.image.is_empty() {
+                page.image = images
+                    .get(&page.image)
+                    .context("alignment image missing")?
+                    .path
+                    .clone();
+            }
+        }
+        Ok(PageReviews {
+            alignment,
+            sections,
+        })
+    };
+    let result = read();
+    // Surface pause/cancel directly, including cancellation during ControlledIo
+    // reads, before adding the explanation for an unreadable report.
+    control.check()?;
+    result.map(Some).context(crate::tr!(
+        "导出失败：PDF 页面核对信息无效或已过期，原笔记未修改。"
+    ))
 }
 
 #[derive(serde::Serialize)]
@@ -330,10 +423,19 @@ pub fn export_document(
         return Ok(Vec::new());
     }
     let images = images(root, document, control)?;
+    let reviews = page_reviews(root, document, &images, control)?;
     destinations
         .iter()
         .map(|(format, destination)| {
-            write_indexed_document(root, document, *format, destination, control, &images)
+            write_indexed_document(
+                root,
+                document,
+                *format,
+                destination,
+                control,
+                &images,
+                reviews.as_ref(),
+            )
         })
         .collect()
 }
@@ -379,6 +481,7 @@ fn write_indexed_document(
     destination: &Path,
     control: &TaskControl,
     images: &BTreeMap<String, ImageAsset>,
+    reviews: Option<&PageReviews>,
 ) -> Result<PathBuf> {
     control.check()?;
     ensure_destination(destination)?;
@@ -434,12 +537,18 @@ fn write_indexed_document(
                     copy_image(root, original, image, &mut zip, control)?;
                 }
             }
+            if let Some(reviews) = reviews {
+                zip.start_file("alignment.json", options)?;
+                let mut out = ControlledIo::new(BufWriter::new(&mut zip), control);
+                serde_json::to_writer_pretty(&mut out, &reviews.alignment)?;
+                out.flush()?;
+            }
             control.check()?;
             zip.finish()?;
         }
         OutputFormat::Html => {
             let mut out = ControlledIo::new(BufWriter::new(file.as_file_mut()), control);
-            render::write_html(
+            render::write_html_with_reviews(
                 &meta,
                 &document.sections,
                 document.summary.as_ref(),
@@ -458,6 +567,7 @@ fn write_indexed_document(
                     encoder.finish()?.flush()?;
                     Ok(())
                 },
+                reviews.map_or(&[], |reviews| reviews.sections.as_slice()),
             )?;
             out.flush()?;
         }
@@ -484,11 +594,14 @@ fn write_indexed_document(
                 sections: document
                     .sections
                     .iter()
-                    .map(|section| PortableSection {
+                    .enumerate()
+                    .map(|(index, section)| PortableSection {
                         t: section.t,
                         end: section.end,
                         image_id: images.get(&section.image).map(|image| image.id.as_str()),
                         speech: &section.speech,
+                        needs_review: reviews
+                            .and_then(|reviews| reviews.sections[index].then_some(true)),
                     })
                     .collect(),
                 images: images
@@ -609,6 +722,184 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    fn alignment_report(document: &Document) -> serde_json::Value {
+        serde_json::json!({
+            "schema": 1,
+            "slides": ["/private/teacher/deck.pdf"],
+            "pages": document.sections.iter().enumerate().map(|(index, section)| {
+                serde_json::json!({
+                    "t": section.t, "image": section.image, "uncertain": index == 1,
+                    "visual": 0.41, "keywords": ["private diagnostic"]
+                })
+            }).collect::<Vec<_>>()
+        })
+    }
+
+    #[test]
+    fn review_exports_match_time_and_image_without_leaking_local_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let mut document = fixture(root.path());
+        document.sections[1].image = document.sections[0].image.clone();
+        let original = serde_json::to_vec(&document).unwrap();
+        let baseline = root.path().join("baseline.zip");
+        write_document(root.path(), &document, OutputFormat::Md, &baseline).unwrap();
+        let mut baseline_zip = zip::ZipArchive::new(File::open(baseline).unwrap()).unwrap();
+        let mut baseline_md = String::new();
+        baseline_zip
+            .by_name("course.md")
+            .unwrap()
+            .read_to_string(&mut baseline_md)
+            .unwrap();
+        let report = serde_json::to_vec(&alignment_report(&document)).unwrap();
+        std::fs::write(root.path().join("alignment.json"), &report).unwrap();
+        let destinations: Vec<_> = [OutputFormat::Md, OutputFormat::Html, OutputFormat::Json]
+            .into_iter()
+            .map(|format| (format, root.path().join("out").join(file_name(format))))
+            .collect();
+        export_document(
+            root.path(),
+            &document,
+            &destinations,
+            &TaskControl::default(),
+        )
+        .unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&destinations[0].1).unwrap()).unwrap();
+        let mut markdown = String::new();
+        zip.by_name("course.md")
+            .unwrap()
+            .read_to_string(&mut markdown)
+            .unwrap();
+        assert_eq!(markdown, baseline_md);
+        let mut exported = String::new();
+        zip.by_name("alignment.json")
+            .unwrap()
+            .read_to_string(&mut exported)
+            .unwrap();
+        for private in ["private", "slides", "visual", "keywords", "deck.pdf"] {
+            assert!(!exported.contains(private), "leaked {private}");
+        }
+        let alignment: serde_json::Value = serde_json::from_str(&exported).unwrap();
+        assert_eq!(alignment["schema"], 1);
+        for (index, page) in alignment["pages"].as_array().unwrap().iter().enumerate() {
+            assert_eq!(page["t"], document.sections[index].t);
+            assert_eq!(page["uncertain"], index == 1);
+            let image = page["image"].as_str().unwrap();
+            assert!(image.starts_with("images/image-"));
+            assert!(zip.by_name(image).is_ok());
+        }
+        let html = std::fs::read_to_string(&destinations[1].1).unwrap();
+        assert_eq!(html.matches("class=\"page-review\"").count(), 1);
+        let marker = html.find("class=\"page-review\"").unwrap();
+        assert!(marker > html.find("<section id=\"t10\"").unwrap());
+        assert!(marker < html.find("<section id=\"t20\"").unwrap());
+        let json_text = std::fs::read_to_string(&destinations[2].1).unwrap();
+        for text in [&html, &json_text, &markdown] {
+            assert!(!text.contains("private"));
+            assert!(!text.contains("deck.pdf"));
+        }
+        let json: serde_json::Value = serde_json::from_str(&json_text).unwrap();
+        assert_eq!(json["schema"], 1);
+        assert!(json["sections"][0].get("needs_review").is_none());
+        assert_eq!(json["sections"][1]["needs_review"], true);
+        assert!(json["sections"][2].get("needs_review").is_none());
+        assert_eq!(
+            std::fs::read(root.path().join("alignment.json")).unwrap(),
+            report
+        );
+        assert_eq!(serde_json::to_vec(&document).unwrap(), original);
+        // Note editing changes speech but keeps section coordinates and reads
+        // the report from the version root, independently of the export stage.
+        document.sections[1].speech[0].text = "Edited note".into();
+        let edited = root.path().join("stage/edited.json");
+        write_document(root.path(), &document, OutputFormat::Json, &edited).unwrap();
+        let edited: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(edited).unwrap()).unwrap();
+        assert_eq!(edited["sections"][1]["needs_review"], true);
+        assert_eq!(edited["sections"][1]["speech"][0]["text"], "Edited note");
+    }
+
+    #[test]
+    fn malformed_or_stale_review_reports_do_not_publish_exports() {
+        let root = tempfile::tempdir().unwrap();
+        let document = fixture(root.path());
+        let mut stale = alignment_report(&document);
+        stale["pages"][1]["t"] = 10.5.into();
+        let mut invalid_time = alignment_report(&document);
+        invalid_time["pages"][1]["t"] = (-1).into();
+        let mut wrong_image = alignment_report(&document);
+        wrong_image["pages"][1]["image"] = "../other.png".into();
+        let mut missing_status = alignment_report(&document);
+        missing_status["pages"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("uncertain");
+        for report in [
+            "broken".into(),
+            r#"{"schema":2,"pages":[]}"#.into(),
+            stale.to_string(),
+            invalid_time.to_string(),
+            wrong_image.to_string(),
+            missing_status.to_string(),
+        ] {
+            std::fs::write(root.path().join("alignment.json"), report).unwrap();
+            for format in [OutputFormat::Md, OutputFormat::Html, OutputFormat::Json] {
+                let destination = root.path().join(file_name(format));
+                assert!(write_document(root.path(), &document, format, &destination).is_err());
+                assert!(!destination.exists());
+                std::fs::write(&destination, b"previous export").unwrap();
+                assert!(write_document(root.path(), &document, format, &destination).is_err());
+                assert_eq!(std::fs::read(&destination).unwrap(), b"previous export");
+                std::fs::remove_file(destination).unwrap();
+            }
+        }
+        File::create(root.path().join("alignment.json"))
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(
+            write_document(
+                root.path(),
+                &document,
+                OutputFormat::Html,
+                &root.path().join("large.html")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn review_report_cancellation_retains_control_cause() {
+        let root = tempfile::tempdir().unwrap();
+        let document = fixture(root.path());
+        std::fs::write(root.path().join("alignment.json"), "broken").unwrap();
+        let images = images(root.path(), &document, &TaskControl::default()).unwrap();
+        let (control, path) = task(root.path());
+        cancel(&path);
+        let error = page_reviews(root.path(), &document, &images, &control)
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<crate::dispatch::Failure>().is_some())
+        );
+        assert_eq!(error.to_string(), control.check().unwrap_err().to_string());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn review_report_cannot_escape_version_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let document = fixture(root.path());
+        let report = outside.path().join("alignment.json");
+        std::fs::write(&report, alignment_report(&document).to_string()).unwrap();
+        std::os::unix::fs::symlink(report, root.path().join("alignment.json")).unwrap();
+        let destination = root.path().join("course.html");
+        assert!(write_document(root.path(), &document, OutputFormat::Html, &destination).is_err());
+        assert!(!destination.exists());
     }
 
     #[test]
@@ -814,7 +1105,8 @@ mod tests {
                     format,
                     &out_dir.join(file_name(format)),
                     &TaskControl::default(),
-                    &images
+                    &images,
+                    None
                 )
                 .is_err()
             );
@@ -950,7 +1242,8 @@ mod tests {
                 OutputFormat::Html,
                 &out,
                 &control,
-                &first
+                &first,
+                None
             )
             .is_err()
         );

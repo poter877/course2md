@@ -2267,9 +2267,16 @@ AI 优化本段（带本段截图）	AI 优化本段（带本段截图）	Improv
 调整字幕时间	调整字幕时间	Adjust subtitle timing	調整字幕時間	字幕のタイミングを調整
 字幕偏移：{} 秒	字幕偏移：{} 秒	Subtitle offset: {} s	字幕偏移：{} 秒	字幕の調整：{} 秒
 首条字幕移到视频开始前，将被跳过	首条字幕移到视频开始前，将被跳过	The first subtitle falls before the video and will be skipped.	首條字幕移到影片開始前，將被跳過	最初の字幕は動画の開始前になるため、スキップされます。
+有 {} 处 PDF 页面需要核对	有 {} 处 PDF 页面需要核对	{} PDF page matches need review	有 {} 處 PDF 頁面需要核對	PDF ページの対応を {} か所確認してください
+查看待核对段落	查看待核对段落	Review flagged passages	查看待核對段落	確認が必要な段落を表示
+PDF 页面待核对，请对照原视频确认。	PDF 页面待核对，请对照原视频确认。	Check this PDF page against the original video.	PDF 頁面待核對，請對照原影片確認。	この PDF ページを元の動画と照合してください。
+下一处待核对	下一处待核对	Next passage to review	下一處待核對	次の確認箇所
+PDF 页面的核对信息暂时无法读取，笔记正文仍可阅读。	PDF 页面的核对信息暂时无法读取，笔记正文仍可阅读。	PDF page review information could not be read. The note is still available.	PDF 頁面的核對資訊暫時無法讀取，筆記正文仍可閱讀。	PDF ページの確認情報を読み込めません。ノート本文は引き続き閲覧できます。
 字幕偏移（秒）：正数延后，负数提前；不影响语音识别 / Subtitle offset in seconds: positive delays, negative advances; does not affect ASR	字幕偏移（秒）：正数延后，负数提前；不影响语音识别	Subtitle offset in seconds: positive delays, negative advances; does not affect ASR	字幕偏移（秒）：正數延後，負數提前；不影響語音辨識	字幕の調整（秒）：正は遅延、負は前倒し。音声認識には影響しません
+视频帧时间戳缺失或无效，无法可靠定位截图	视频帧时间戳缺失或无效，无法可靠定位截图	Video frame timestamps are missing or invalid; screenshots cannot be placed reliably.	影片影格時間戳記缺失或無效，無法可靠定位截圖	動画フレームの時刻が欠落または無効なため、スクリーンショットの位置を正確に特定できません。
 当前字幕已变化，请重新打开时间调整	当前字幕已变化，请重新打开时间调整	The subtitles have changed. Reopen timing adjustment.	目前字幕已變更，請重新開啟時間調整	字幕が変更されました。時間調整を開き直してください
 调整后没有可用字幕，请检查偏移秒数	调整后没有可用字幕，请检查偏移秒数	No subtitles remain after adjustment. Check the offset.	調整後沒有可用字幕，請檢查偏移秒數	調整後に有効な字幕が残りません。オフセットを確認してください
+导出失败：PDF 页面核对信息无效或已过期，原笔记未修改。	导出失败：PDF 页面核对信息无效或已过期，原笔记未修改。	Export failed: PDF page review information is invalid or outdated. The original note is unchanged.	匯出失敗：PDF 頁面核對資訊無效或已過期，原筆記未修改。	書き出しに失敗しました。PDF ページの確認情報が無効または古くなっています。元のノートは変更していません。
 外部幻灯片 PDF：可靠匹配使用 PDF 页，其余保留视频截图（可重复，按顺序编号 deck）	外部幻灯片 PDF：可靠匹配使用 PDF 页，其余保留视频截图（可重复，按顺序编号 deck）	Slide PDF: use reliably matched pages, otherwise keep video screenshots (repeatable; decks follow input order)	外部投影片 PDF：可靠匹配使用 PDF 頁，其餘保留影片截圖（可重複，依順序編號 deck）	スライド PDF：確実に一致するページを使い、それ以外は動画の画像を残す（複数指定可、指定順に資料番号を付与）
 外部字幕文件（SRT/VTT），优先于平台字幕与同名旁挂字幕	外部字幕文件（SRT/VTT），优先于平台字幕与同名旁挂字幕	Subtitle file (SRT/VTT), preferred over platform subtitles and same-name sidecar files	外部字幕檔案（SRT/VTT），優先於平台字幕與同名附加字幕	字幕ファイル（SRT/VTT）。配信元の字幕や同名の字幕ファイルより優先
 PDF 匹配结果的视觉复核阈值 (0,1]，默认 0.35	PDF 匹配结果的视觉复核阈值 (0,1]，默认 0.35	Visual review threshold for PDF matches (0,1], default 0.35	PDF 匹配結果的視覺複核閾值 (0,1]，預設 0.35	PDF ページの一致を確認する視覚スコアのしきい値 (0,1]、既定値 0.35

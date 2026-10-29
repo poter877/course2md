@@ -2019,6 +2019,72 @@ fn watch_from_chip(
     }
 }
 
+fn next_page_review(preview: &notes::Preview, after: Option<usize>) -> Option<&notes::PageReview> {
+    preview
+        .page_reviews
+        .iter()
+        .find(|review| after.is_none_or(|block| review.block > block))
+        .or_else(|| preview.page_reviews.first())
+}
+
+/// A persistent explanation beside the affected section, with no file access.
+fn page_review_hint(flow: &NoteFlow, heading: usize) -> Option<AnyElement> {
+    flow.preview
+        .page_reviews
+        .iter()
+        .find(|review| review.block == heading)?;
+    let mut hint = h_flex()
+        .w_full()
+        .min_w_0()
+        .gap_2()
+        .items_start()
+        .flex_wrap()
+        .child(
+            icons::info()
+                .size(ICON_SLOT)
+                .flex_shrink_0()
+                .text_color(color(WARNING)),
+        )
+        .child(
+            theme::accessible_text(
+                ("reader-page-review", heading),
+                course2md::tr!("PDF 页面待核对，请对照原视频确认。"),
+            )
+            .text_sm()
+            .flex_1()
+            .min_w_0(),
+        );
+    if flow.preview.page_reviews.len() > 1
+        && let Some(next) = next_page_review(&flow.preview, Some(heading))
+    {
+        let target = next.block;
+        let preview = flow.preview.clone();
+        let desktop = flow.desktop.clone();
+        hint = hint.child(
+            flow.reveal(
+                ("reveal-next-page-review", heading).into(),
+                quiet(("next-page-review", heading))
+                    .icon(icons::arrow_forward())
+                    .label(course2md::tr!("下一处待核对"))
+                    .on_click(move |_, _, cx| {
+                        let _ = desktop.update(cx, |this, cx| {
+                            if this
+                                .preview
+                                .as_ref()
+                                .is_some_and(|current| Rc::ptr_eq(current, &preview))
+                            {
+                                this.jump_reader_block(target, 0., cx);
+                            }
+                        });
+                    })
+                    .into_any_element(),
+            )
+            .inline(),
+        );
+    }
+    Some(hint.into_any_element())
+}
+
 /// A section: the chapter title where one begins with the chip that plays
 /// the source from its time, the paragraphs, then the screenshot.
 fn render_note_section(
@@ -2092,6 +2158,7 @@ fn render_note_section(
         .min_w_0()
         .gap_4()
         .child(title_row)
+        .children(page_review_hint(flow, heading))
         .children(flow.missing_images(heading))
         .children(paragraphs)
         .children(images.map(|image| div().w_full().mt_2().child(image)))
@@ -5796,6 +5863,50 @@ impl Desktop {
             }
         };
         let mut notices = Vec::new();
+        if let Some(first) = next_page_review(preview, None) {
+            let target = first.block;
+            let snapshot = preview.clone();
+            let mut notice = notice_banner(
+                "reader-page-review-summary",
+                NoticeKind::Info,
+                course2md::tr!("有 {} 处 PDF 页面需要核对", preview.page_reviews.len()),
+            )
+            .child(reveal(
+                "reveal-first-page-review",
+                outline_pill("first-page-review", cx)
+                    .icon(icons::article())
+                    .label(course2md::tr!("查看待核对段落"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this
+                            .preview
+                            .as_ref()
+                            .is_some_and(|current| Rc::ptr_eq(current, &snapshot))
+                        {
+                            this.jump_reader_block(target, 0., cx);
+                        }
+                    }))
+                    .into_any_element(),
+            ));
+            if let Some(url) = self
+                .reader_ui
+                .source
+                .as_ref()
+                .and_then(|source| nav::seek_url(source, first.seconds))
+            {
+                notice = notice.child(reveal(
+                    "reveal-watch-page-review",
+                    quiet("watch-page-review")
+                        .icon(icons::play())
+                        .label(course2md::tr!(
+                            "从 {} 播放原视频",
+                            course2md::render::fmt_ts(first.seconds)
+                        ))
+                        .on_click(move |_, _, cx| cx.open_url(&url))
+                        .into_any_element(),
+                ));
+            }
+            notices.push(notice.into_any_element());
+        }
         // 进行中/完成状态始终在正文顶部可见：带耗时与取消/关闭。
         if let Some(status) = self.reader_ui.ai_edit.status.clone() {
             let busy = self.reader_ui.ai_edit.busy();
@@ -8041,6 +8152,51 @@ mod tests {
         image_zoom_offset, load_reader_data, matching_frames, nav, processing_notice,
     };
     use crate::{notes::Course, source, workspace};
+
+    #[test]
+    fn pdf_review_navigation_reaches_exact_sections_and_wraps_without_using_page_numbers() {
+        let root = tempfile::tempdir().unwrap();
+        let course = fixture_version(root.path(), 1, &[10., 20., 30.]);
+        let mut preview = crate::notes::read_preview(course).unwrap();
+        preview.page_reviews = preview
+            .blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(block, value)| match value {
+                PreviewBlock::Heading {
+                    seconds: Some(seconds),
+                    ..
+                } if *seconds >= 20. => Some(crate::notes::PageReview {
+                    block,
+                    seconds: *seconds,
+                }),
+                _ => None,
+            })
+            .collect();
+        let first = super::next_page_review(&preview, None).unwrap();
+        assert_eq!(first.seconds, 20.);
+        let second = super::next_page_review(&preview, Some(first.block)).unwrap();
+        assert_eq!(second.seconds, 30.);
+        assert_eq!(
+            super::next_page_review(&preview, Some(second.block))
+                .unwrap()
+                .block,
+            first.block
+        );
+        assert!(
+            matches!(&preview.blocks[first.block], PreviewBlock::Heading { anchor, .. } if anchor == "section-1")
+        );
+        let source = nav::source_target(&preview.document.meta.webpage_url, false).unwrap();
+        let url = nav::seek_url(&source, first.seconds).unwrap();
+        let parsed = url::Url::parse(&url).unwrap();
+        assert!(
+            parsed
+                .query_pairs()
+                .any(|(key, value)| key == "t" && value == "20")
+        );
+        preview.page_reviews.clear();
+        assert!(super::next_page_review(&preview, None).is_none());
+    }
 
     #[test]
     fn keys_scroll_the_screenshot_text_within_its_range() {

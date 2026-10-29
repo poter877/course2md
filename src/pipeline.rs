@@ -372,7 +372,12 @@ async fn reprocess(
         .filter(|section| !section.image.is_empty())
         .map(|section| section.image.clone())
         .collect();
-    {
+    let review_sections = document
+        .sections
+        .iter()
+        .map(|section| (section.t, section.image.clone()))
+        .collect::<Vec<_>>();
+    let has_page_reviews = {
         let (base_dir, out_dir, timeline, control) = (
             base_dir.to_path_buf(),
             job.dir.clone(),
@@ -392,10 +397,10 @@ async fn reprocess(
             if base_dir.join("timeline.jsonl").is_file() {
                 std::fs::copy(base_dir.join("timeline.jsonl"), timeline)?;
             }
-            Ok(())
+            copy_reprocess_alignment(&base_dir, &out_dir, &review_sections, &control)
         })
-        .await?;
-    }
+        .await?
+    };
     // All base inputs are now copied; release the snapshot before remote work.
     drop(base_guard);
     for section in &mut document.sections {
@@ -448,6 +453,7 @@ async fn reprocess(
             Ok(frames) if !frames.is_empty() => {
                 let speech = all_speech(&document.sections);
                 document.sections = timeline::merge(frames, speech, document.meta.duration);
+                update_rebuilt_screenshot_review(&job.dir, &document.sections, has_page_reviews)?;
                 outcomes.screenshots = Outcome::succeeded();
             }
             result => {
@@ -560,6 +566,102 @@ async fn reprocess(
     .await?;
     emit_done(target, &manifest, &document.sections, started);
     Ok(())
+}
+
+// Called while the base version's shared read guard is held. Retain diagnostics
+// internally; portable exports apply their own field whitelist.
+fn copy_reprocess_alignment(
+    base: &Path,
+    work: &Path,
+    sections: &[(f64, String)],
+    control: &TaskControl,
+) -> Result<bool> {
+    use std::io::Read;
+    control.check()?;
+    let invalid = crate::tr!("PDF 页面的核对信息暂时无法读取，笔记正文仍可阅读。");
+    let read = || -> Result<bool> {
+        match std::fs::symlink_metadata(base.join("alignment.json")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                remove_work_alignment(work)?;
+                return Ok(false);
+            }
+            result => {
+                result?;
+            }
+        }
+        let path = artifact::safe_asset_path(base, "alignment.json")?;
+        anyhow::ensure!(std::fs::metadata(&path)?.is_file(), "{invalid}");
+        let mut bytes = Vec::new();
+        const LIMIT: u64 = 16 * 1024 * 1024;
+        std::fs::File::open(path)?
+            .take(LIMIT + 1)
+            .read_to_end(&mut bytes)?;
+        control.check()?;
+        anyhow::ensure!(bytes.len() as u64 <= LIMIT, "{invalid}");
+        let mut report: serde_json::Value = serde_json::from_slice(&bytes)?;
+        anyhow::ensure!(report["schema"].as_u64() == Some(1), "{invalid}");
+        let mut positions = std::collections::HashMap::new();
+        for (t, image) in sections {
+            *positions
+                .entry((t.to_bits(), image.as_str()))
+                .or_insert(0usize) += 1;
+        }
+        let pages = report["pages"].as_array_mut().context(invalid)?;
+        for page in pages {
+            control.check()?;
+            let t = page["t"].as_f64().context(invalid)?;
+            let image = page["image"].as_str().context(invalid)?;
+            anyhow::ensure!(
+                t.is_finite()
+                    && t >= 0.0
+                    && page["uncertain"].is_boolean()
+                    && positions.get(&(t.to_bits(), image)) == Some(&1),
+                "{invalid}"
+            );
+            if !image.is_empty() {
+                page["image"] = format!("base/{image}").into();
+            }
+        }
+        control.check()?;
+        crate::checkpoint::atomic_write(
+            &work.join("alignment.json"),
+            &serde_json::to_vec_pretty(&report)?,
+        )?;
+        Ok(true)
+    };
+    read().context(invalid)
+}
+
+fn remove_work_alignment(work: &Path) -> Result<()> {
+    match std::fs::remove_file(work.join("alignment.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result.map_err(Into::into),
+    }
+}
+
+fn update_rebuilt_screenshot_review(
+    work: &Path,
+    sections: &[timeline::Section],
+    had_page_reviews: bool,
+) -> Result<()> {
+    if had_page_reviews {
+        // These are new video frames, not confirmed PDF matches. Carry the
+        // need to review forward without retaining old paths, scores or pages.
+        let pages = sections
+            .iter()
+            .map(|section| {
+                serde_json::json!({
+                    "t": section.t, "image": section.image, "uncertain": true
+                })
+            })
+            .collect::<Vec<_>>();
+        crate::checkpoint::atomic_write(
+            &work.join("alignment.json"),
+            &serde_json::to_vec_pretty(&serde_json::json!({"schema": 1, "pages": pages}))?,
+        )
+    } else {
+        remove_work_alignment(work)
+    }
 }
 
 /// Export-only reprocessing writes beside the base version and never publishes a new one.
@@ -1244,9 +1346,13 @@ async fn save_timeline(
 
 #[derive(Serialize, Deserialize)]
 struct FramesCache {
+    /// Bump when detection or timestamp semantics change. Missing means legacy.
+    #[serde(default)]
+    scan_revision: u32,
     frames: Vec<timeline::FrameEvent>,
     files: Vec<(String, String)>,
 }
+const SCAN_REVISION: u32 = 1;
 async fn cached_frames(
     cfg: &PipelineConfig,
     job: &Job,
@@ -1257,7 +1363,7 @@ async fn cached_frames(
         let cache: FramesCache = serde_json::from_slice(&std::fs::read(&cache_path)?).context(
             crate::tr!("截图进度损坏，原文件已保留 / Screenshot checkpoint is damaged"),
         )?;
-        if !cache.frames.is_empty() {
+        if cache.scan_revision == SCAN_REVISION && !cache.frames.is_empty() {
             let (out_dir, control) = (job.dir.clone(), job.control.clone());
             if blocking(move || Ok(verified_cache_files(&out_dir, &cache.files, &control))).await? {
                 return Ok(cache.frames);
@@ -1286,6 +1392,7 @@ async fn cached_frames(
     crate::checkpoint::atomic_write(
         &cache_path,
         &serde_json::to_vec_pretty(&FramesCache {
+            scan_revision: SCAN_REVISION,
             frames: frames.clone(),
             files,
         })?,
@@ -1667,6 +1774,117 @@ fn should_delete_media(
 #[cfg(test)]
 mod tests {
     use super::{run, should_delete_media};
+
+    #[test]
+    fn reprocess_alignment_rewrites_each_generation_and_marks_rebuilt_frames_for_review() {
+        let base = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let next = tempfile::tempdir().unwrap();
+        let report = serde_json::json!({"schema":1,"slides":["original.pdf"],"pages":[
+            {"t":1.25,"image":"slides/page.png","uncertain":true,"visual":0.2},
+            {"t":3.5,"image":"slides/page.png","uncertain":false}
+        ]});
+        let bytes = serde_json::to_vec(&report).unwrap();
+        std::fs::write(base.path().join("alignment.json"), &bytes).unwrap();
+        let sections = vec![
+            (1.25, "slides/page.png".into()),
+            (3.5, "slides/page.png".into()),
+        ];
+        let control = super::TaskControl::default();
+        assert!(
+            super::copy_reprocess_alignment(base.path(), work.path(), &sections, &control).unwrap()
+        );
+        let copied: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(work.path().join("alignment.json")).unwrap())
+                .unwrap();
+        assert_eq!(copied["pages"][0]["image"], "base/slides/page.png");
+        assert_eq!(copied["pages"][1]["image"], "base/slides/page.png");
+        assert_eq!(copied["pages"][0]["uncertain"], true);
+        assert_eq!(copied["pages"][0]["visual"], report["pages"][0]["visual"]);
+        let sections = vec![
+            (1.25, "base/slides/page.png".into()),
+            (3.5, "base/slides/page.png".into()),
+        ];
+        assert!(
+            super::copy_reprocess_alignment(work.path(), next.path(), &sections, &control).unwrap()
+        );
+        let repeated: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(next.path().join("alignment.json")).unwrap())
+                .unwrap();
+        assert_eq!(repeated["pages"][0]["image"], "base/base/slides/page.png");
+        let rebuilt = vec![crate::timeline::Section {
+            t: 0.75,
+            end: 4.0,
+            image: "frames/new.png".into(),
+            speech: vec![],
+        }];
+        super::update_rebuilt_screenshot_review(next.path(), &rebuilt, true).unwrap();
+        let fresh: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(next.path().join("alignment.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            fresh,
+            serde_json::json!({"schema":1,"pages":[{"t":0.75,"image":"frames/new.png","uncertain":true}]})
+        );
+        // A following retry still sees review information and cannot erase it.
+        let retry = tempfile::tempdir().unwrap();
+        assert!(
+            super::copy_reprocess_alignment(
+                next.path(),
+                retry.path(),
+                &[(0.75, "frames/new.png".into())],
+                &control
+            )
+            .unwrap()
+        );
+        super::update_rebuilt_screenshot_review(retry.path(), &rebuilt, true).unwrap();
+        assert_eq!(
+            std::fs::read(retry.path().join("alignment.json")).unwrap(),
+            std::fs::read(next.path().join("alignment.json")).unwrap()
+        );
+        assert!(work.path().join("alignment.json").exists());
+        assert_eq!(
+            std::fs::read(base.path().join("alignment.json")).unwrap(),
+            bytes
+        );
+        super::update_rebuilt_screenshot_review(next.path(), &rebuilt, false).unwrap();
+        assert!(!next.path().join("alignment.json").exists());
+    }
+
+    #[test]
+    fn reprocess_alignment_rejects_stale_reports_and_removes_leftovers_for_legacy_notes() {
+        let base = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let control = super::TaskControl::default();
+        let target = work.path().join("alignment.json");
+        std::fs::write(&target, "leftover from a previous attempt").unwrap();
+        assert!(!super::copy_reprocess_alignment(base.path(), work.path(), &[], &control).unwrap());
+        assert!(!target.exists());
+        for report in ["{".to_owned(), serde_json::json!({"schema":1,"pages":[{"t":2.,"image":"slides/p.png","uncertain":true}]}).to_string()] {
+            std::fs::write(base.path().join("alignment.json"), report).unwrap();
+            assert!(super::copy_reprocess_alignment(base.path(), work.path(), &[(1., "slides/p.png".into())], &control).is_err());
+            assert!(!target.exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reprocess_alignment_rejects_external_report_links() {
+        let base = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::os::unix::fs::symlink(outside.path(), base.path().join("alignment.json")).unwrap();
+        assert!(
+            super::copy_reprocess_alignment(
+                base.path(),
+                work.path(),
+                &[],
+                &super::TaskControl::default()
+            )
+            .is_err()
+        );
+        assert!(!work.path().join("alignment.json").exists());
+    }
 
     #[test]
     fn batch_tasks_discover_subtitles_at_runtime_only_without_confirmed_text() {

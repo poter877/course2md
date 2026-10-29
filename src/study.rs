@@ -30,6 +30,8 @@ pub struct OrganizedSection {
 pub struct StudyAnswer {
     pub id: String,
     pub spans: Vec<SourceSpan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub image_sections: Vec<usize>,
     pub question: String,
     pub text: String,
 }
@@ -142,6 +144,7 @@ impl StudyAnswer {
         Ok(Self {
             id: crate::random_b64url(18)?,
             spans,
+            image_sections: Vec::new(),
             question,
             text,
         })
@@ -323,6 +326,15 @@ fn validate_controlled(note: &StudyNote, control: &TaskControl) -> Result<()> {
             );
         }
         note.visit_spans(&answer.spans, |_| control.check())?;
+        ensure!(
+            answer.image_sections.len() <= 4
+                && answer.image_sections.iter().all(|id| note
+                    .source
+                    .sections
+                    .get(*id)
+                    .is_some_and(|section| !section.image.is_empty())),
+            crate::tr!("学习笔记记录无效，原文件已保留")
+        );
         ensure!(
             !answer.id.is_empty()
                 && ids.insert(&answer.id)
@@ -533,12 +545,14 @@ mod tests {
             )
             .unwrap(),
         );
+        note.answers[0].image_sections = vec![0];
         let saved = save(dir.path(), 0, &note, &TaskControl::default()).unwrap();
         let updated = organized(&saved);
         save(dir.path(), 1, &updated, &TaskControl::default()).unwrap();
         let loaded = load(dir.path()).unwrap();
         assert_eq!(loaded.answers.len(), 1);
         assert_eq!(loaded.answers[0].id, note.answers[0].id);
+        assert_eq!(loaded.answers[0].image_sections, vec![0]);
         assert_eq!(loaded.quote(&loaded.answers[0].spans).unwrap(), "repeat");
     }
 
@@ -646,6 +660,7 @@ mod tests {
         let mut note = StudyNote::from_document(source).unwrap();
         for index in 0..65 {
             note.answers.push(StudyAnswer {
+                image_sections: Vec::new(),
                 id: index.to_string(),
                 spans: vec![SourceSpan {
                     section: 0,

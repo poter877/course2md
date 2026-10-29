@@ -483,6 +483,20 @@ pub fn ask(
     settings: &LlmSettings,
     control: &TaskControl,
 ) -> Result<String> {
+    ask_with_images(root, note, (spans, None), question, settings, control)
+}
+
+/// Explicit reader image selections override the automatic per-quote screenshots.
+/// Image references are section indices in the same immutable source snapshot.
+pub fn ask_with_images(
+    root: &Path,
+    note: &StudyNote,
+    source: (&[SourceSpan], Option<&[usize]>),
+    question: &str,
+    settings: &LlmSettings,
+    control: &TaskControl,
+) -> Result<String> {
+    let (spans, selected_images) = source;
     control.check()?;
     ensure!(
         !question.trim().is_empty(),
@@ -493,9 +507,20 @@ pub fn ask(
         crate::tr!("学习请求过大，请缩小选区后重试")
     );
     let quote = note.quote(spans)?;
-    let ids: BTreeSet<_> = spans.iter().map(|span| span.section).collect();
+    let mut ids: BTreeSet<_> = spans.iter().map(|span| span.section).collect();
+    ensure!(ids.len() <= 4, crate::tr!("学习请求过大，请缩小选区后重试"));
+    let image_ids: BTreeSet<_> =
+        selected_images.map_or_else(|| ids.clone(), |images| images.iter().copied().collect());
     ensure!(
-        quote.len() <= CHUNK_BYTES && ids.len() <= 4,
+        !image_ids.is_empty() && image_ids.len() <= 4,
+        crate::tr!("学习请求过大，请缩小选区后重试")
+    );
+    for id in &image_ids {
+        section(note, *id)?;
+    }
+    ids.extend(&image_ids);
+    ensure!(
+        quote.len() <= CHUNK_BYTES && ids.len() <= 8,
         crate::tr!("学习请求过大，请缩小选区后重试")
     );
     let context: Vec<_> = spans.iter().map(|span| {
@@ -506,13 +531,13 @@ pub fn ask(
             "previous":span.speech.checked_sub(1).map(|index| {let text = &section.speech[index].text; context_window(text,text.len(),text.len())}),
             "next":section.speech.get(span.speech+1).map(|speech|context_window(&speech.text,0,0))})
     }).collect();
-    let payload = json!({"quote":quote,"question":question,"context":context,"sections":ids});
+    let payload = json!({"quote":quote,"question":question,"context":context,"sections":ids,"image_sections":image_ids});
     ensure!(
         payload.to_string().len() <= MAX_TEXT_BYTES,
         crate::tr!("学习请求过大，请缩小选区后重试")
     );
     let mut content = vec![json!({"type":"text","text":payload.to_string()})];
-    for id in &ids {
+    for id in &image_ids {
         content.push(json!({"type":"text","text":format!("section {id} screenshot")}));
         content.push(image_content(root, &section(note, *id)?.image, control)?);
     }
@@ -1179,6 +1204,63 @@ mod tests {
                 &note,
                 &invalid,
                 "为什么？",
+                &settings,
+                &TaskControl::default()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn question_uses_only_explicitly_dragged_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut note = fixture(dir.path());
+        let mut other = note.source.sections[0].clone();
+        other.image = "picked.png".into();
+        image::RgbImage::from_pixel(3, 3, image::Rgb([80, 20, 10]))
+            .save(dir.path().join(&other.image))
+            .unwrap();
+        note.source.sections.push(other);
+        let image_id = note.source.sections.len() - 1;
+        let expected_image =
+            image_content(dir.path(), "picked.png", &TaskControl::default()).unwrap();
+        let spans = [SourceSpan {
+            section: 0,
+            speech: 0,
+            start: 0,
+            end: 6,
+        }];
+        let (settings, worker) = serve(1, move |body, _| {
+            let input = payload(body);
+            assert_eq!(input["image_sections"], json!([image_id]));
+            let images: Vec<_> = body["messages"][1]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|part| part["type"] == "image_url")
+                .collect();
+            assert_eq!(images, vec![&expected_image]);
+            (200, json!({"schema":1,"sections":input["sections"],"quote":input["quote"],"text":"Answer","review":[]}).to_string())
+        });
+        assert_eq!(
+            ask_with_images(
+                dir.path(),
+                &note,
+                (&spans, Some(&[image_id])),
+                "Why?",
+                &settings,
+                &TaskControl::default()
+            )
+            .unwrap(),
+            "Answer"
+        );
+        assert_eq!(worker.join().unwrap().len(), 1);
+        assert!(
+            ask_with_images(
+                dir.path(),
+                &note,
+                (&spans, Some(&[usize::MAX])),
+                "Why?",
                 &settings,
                 &TaskControl::default()
             )

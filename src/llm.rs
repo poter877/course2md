@@ -393,6 +393,8 @@ pub fn enhance_regions(
 }
 
 /// Region editing shares the caller's cancellation and request retry boundaries.
+/// Input IDs must be unique. Results contain each input ID exactly once, sorted
+/// by ID; every keep range is a nonempty UTF-8 byte range in that ID's input text.
 pub fn enhance_regions_in_task(
     settings: &LlmSettings,
     items: &[(usize, String)],
@@ -405,6 +407,14 @@ pub fn enhance_regions_in_task(
     if items.is_empty() {
         return Ok(Vec::new());
     }
+    let expected: std::collections::HashMap<usize, &str> = items
+        .iter()
+        .map(|(id, text)| (*id, text.as_str()))
+        .collect();
+    anyhow::ensure!(
+        expected.len() == items.len(),
+        crate::tr!("编辑结果与选中片段不对应 / Edit ids do not match the selected text")
+    );
     let payload: Vec<serde_json::Value> = items
         .iter()
         .map(|(id, text)| serde_json::json!({"id": id, "text": text}))
@@ -460,12 +470,36 @@ pub fn enhance_regions_in_task(
     );
     let agent = chat_agent();
     let description = crate::tr!("优化笔记选中片段 / Improve selected note text");
-    let validate = |content: &str| {
+    // Validate correspondence inside the request ledger as well as on return;
+    // invalid model output must never become a reusable completed response.
+    let parse_checked = |content: &str| -> Result<Vec<RegionEdit>> {
+        control.check()?;
+        let edits = parse_regions(content).context(crate::tr!(
+            "服务返回的编辑结构无效 / Invalid edit structure"
+        ))?;
+        let mut seen = std::collections::HashSet::new();
         anyhow::ensure!(
-            parse_regions(content).is_some(),
-            crate::tr!("服务返回的编辑结构无效 / Invalid edit structure")
+            edits.len() == expected.len(),
+            crate::tr!("编辑结果与选中片段不对应 / Edit ids do not match the selected text")
         );
-        Ok(())
+        for edit in &edits {
+            control.check()?;
+            anyhow::ensure!(
+                seen.insert(edit.id),
+                crate::tr!("编辑结果与选中片段不对应 / Edit ids do not match the selected text")
+            );
+            let source = expected.get(&edit.id).context(crate::tr!(
+                "编辑结果与选中片段不对应 / Edit ids do not match the selected text"
+            ))?;
+            for &(start, end) in &edit.keep {
+                control.check()?;
+                anyhow::ensure!(
+                    start < end && source.get(start..end).is_some(),
+                    crate::tr!("服务返回的编辑结构无效 / Invalid edit structure")
+                );
+            }
+        }
+        Ok(edits)
     };
     let content = send_chat_described(
         &agent,
@@ -474,18 +508,14 @@ pub fn enhance_regions_in_task(
         &body,
         Purpose::Proofreading,
         description,
-        &validate,
-    )?;
-    control.check()?;
-    let mut edits = parse_regions(&content).context(crate::tr!(
-        "服务返回的编辑结构无效 / Invalid edit structure"
-    ))?;
-    let expected: std::collections::HashSet<usize> = items.iter().map(|(id, _)| *id).collect();
-    anyhow::ensure!(
-        edits.len() == expected.len() && edits.iter().all(|edit| expected.contains(&edit.id)),
-        crate::tr!("编辑结果与选中片段不对应 / Edit ids do not match the selected text")
+        &|content| parse_checked(content).map(|_| ()),
     );
+    // Prefer cancellation even if the in-flight response fails validation or
+    // transport. No successful or failed response can hide the shared flag.
+    control.check()?;
+    let mut edits = parse_checked(&content?)?;
     edits.sort_by_key(|edit| edit.id);
+    control.check()?;
     Ok(edits)
 }
 
@@ -494,22 +524,22 @@ fn parse_regions(content: &str) -> Option<Vec<RegionEdit>> {
     let edits = object.get("edits")?.as_array()?;
     let mut out = Vec::with_capacity(edits.len());
     for edit in edits {
-        let id = edit.get("id")?.as_u64()? as usize;
-        let keep = edit
-            .get("keep")
-            .and_then(|value| value.as_array())
-            .map(|pairs| {
-                pairs
-                    .iter()
-                    .filter_map(|pair| {
-                        let range = pair.as_array()?;
-                        let start = range.first()?.as_u64()? as usize;
-                        let end = range.get(1)?.as_u64()? as usize;
-                        (start < end).then_some((start, end))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let id = usize::try_from(edit.get("id")?.as_u64()?).ok()?;
+        let mut keep = Vec::new();
+        if let Some(pairs) = edit.get("keep") {
+            for pair in pairs.as_array()? {
+                let range = pair.as_array()?;
+                if range.len() != 2 {
+                    return None;
+                }
+                let start = usize::try_from(range[0].as_u64()?).ok()?;
+                let end = usize::try_from(range[1].as_u64()?).ok()?;
+                if start >= end {
+                    return None;
+                }
+                keep.push((start, end));
+            }
+        }
         let cleaned = edit
             .get("cleaned")
             .and_then(|value| value.as_str())?
@@ -1648,12 +1678,17 @@ mod region_tests {
     }
 
     fn serve_once(reply: String) -> u16 {
+        serve_once_with(reply, || {})
+    }
+
+    fn serve_once_with(reply: String, before_response: impl FnOnce() + Send + 'static) -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut buf = vec![0u8; 65536];
             let _ = stream.read(&mut buf);
+            before_response();
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 reply.len(),
@@ -1662,6 +1697,224 @@ mod region_tests {
             let _ = stream.write_all(response.as_bytes());
         });
         port
+    }
+
+    fn http_region_result(
+        edits: serde_json::Value,
+        items: &[(usize, String)],
+    ) -> (Result<Vec<RegionEdit>>, Vec<crate::dispatch::Receipt>) {
+        let reply = serde_json::json!({
+            "choices": [{"message": {"content": serde_json::json!({"edits": edits}).to_string()}}]
+        });
+        let (address, server) =
+            crate::test_http::serve(vec![crate::test_http::json_response(&reply.to_string())]);
+        let settings = LlmSettings {
+            base_url: format!("{address}/v1"),
+            api_key: "test".into(),
+            model: "test".into(),
+            ..LlmSettings::default()
+        };
+        let work = tempfile::tempdir().unwrap();
+        let control = crate::dispatch::TaskControl::open(work.path(), Default::default()).unwrap();
+        let result = enhance_regions_in_task(&settings, items, None, None, &[], &control);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let sent: serde_json::Value =
+            serde_json::from_str(body["messages"][1]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            sent,
+            serde_json::Value::Array(
+                items
+                    .iter()
+                    .map(|(id, text)| serde_json::json!({"id": id, "text": text}))
+                    .collect()
+            )
+        );
+        (result, crate::dispatch::receipts(work.path()).unwrap())
+    }
+
+    #[test]
+    fn region_http_rejects_duplicate_missing_and_unexpected_ids_as_failed_receipts() {
+        let items = [(7, "first".into()), (42, "second".into())];
+        for ids in [vec![7, 7], vec![7], vec![], vec![7, 99], vec![7, 42, 42]] {
+            let edits: Vec<_> = ids
+                .iter()
+                .map(|id| {
+                    serde_json::json!({
+                        "id": id, "cleaned": "changed", "keep": [[0, 1]]
+                    })
+                })
+                .collect();
+            let (result, receipts) = http_region_result(edits.into(), &items);
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                crate::tr!("编辑结果与选中片段不对应 / Edit ids do not match the selected text"),
+                "IDs: {ids:?}"
+            );
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].state, crate::dispatch::State::Failed);
+            assert!(receipts[0].response.is_none());
+        }
+    }
+
+    #[test]
+    fn region_http_validates_keep_against_the_matching_input_not_response_order() {
+        let items = [(42, "前🙂后".into()), (7, "ab".into())];
+        let edits = serde_json::json!([
+            {"id": 7, "cleaned": "AB", "keep": [[0, 1], [1, 2]]},
+            {"id": 42, "cleaned": "前后", "keep": [[0, 3], [3, 7], [7, 10]]}
+        ]);
+        let (result, receipts) = http_region_result(edits, &items);
+        let result = result.unwrap();
+        assert_eq!(
+            result.iter().map(|edit| edit.id).collect::<Vec<_>>(),
+            [7, 42]
+        );
+        assert_eq!(result[1].keep, [(0, 3), (3, 7), (7, 10)]);
+        assert_eq!(receipts[0].state, crate::dispatch::State::Completed);
+
+        // [0, 3] fits input 42 but must be rejected for the shorter input 7.
+        let edits = serde_json::json!([
+            {"id": 42, "cleaned": "前后", "keep": []},
+            {"id": 7, "cleaned": "AB", "keep": [[0, 3]]}
+        ]);
+        let (result, receipts) = http_region_result(edits, &items);
+        assert!(result.is_err());
+        assert_eq!(receipts[0].state, crate::dispatch::State::Failed);
+    }
+
+    #[test]
+    fn region_http_rejects_invalid_utf8_and_malformed_keep_instead_of_dropping_ranges() {
+        for keep in [
+            serde_json::json!([[1, 3]]),
+            serde_json::json!([[3, 6]]),
+            serde_json::json!([[3, 11]]),
+            serde_json::json!([[3, 3]]),
+            serde_json::json!([[7, 3]]),
+            serde_json::json!([[0, 3], [1, 3]]),
+            serde_json::json!([[0, 3, 7]]),
+            serde_json::json!([[0]]),
+            serde_json::json!([[-1, 3]]),
+            serde_json::json!([["0", 3]]),
+            serde_json::json!([[0.5, 3]]),
+            serde_json::json!([[0, u64::MAX]]),
+            serde_json::json!([null]),
+            serde_json::json!(null),
+            serde_json::json!("bad"),
+        ] {
+            let edits = serde_json::json!([{"id": 42, "cleaned": "changed", "keep": keep}]);
+            let (result, receipts) = http_region_result(edits, &[(42, "前🙂后".into())]);
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                crate::tr!("服务返回的编辑结构无效 / Invalid edit structure"),
+                "keep: {keep}"
+            );
+            assert_eq!(receipts[0].state, crate::dispatch::State::Failed);
+            assert!(receipts[0].response.is_none());
+        }
+    }
+
+    #[test]
+    fn duplicate_region_input_ids_are_rejected_before_image_reads_or_http() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let settings = LlmSettings {
+            base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            ..LlmSettings::default()
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let result = enhance_regions_in_task(
+            &settings,
+            &[(7, "first".into()), (7, "second".into())],
+            None,
+            None,
+            &[temp.path().join("missing.png")],
+            &Default::default(),
+        );
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            crate::tr!("编辑结果与选中片段不对应 / Edit ids do not match the selected text")
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn region_http_cancellation_overrides_success_and_invalid_responses() {
+        for content in [
+            serde_json::json!({"edits": [{"id": 0, "cleaned": "changed", "keep": [[0, 5]]}]}),
+            serde_json::json!({"edits": [{"id": 99, "cleaned": "wrong id"}]}),
+            serde_json::json!({"edits": [{"id": 0, "cleaned": "bad range", "keep": [[1, 99]]}]}),
+            serde_json::json!({"edits": "malformed"}),
+            serde_json::Value::Null,
+        ] {
+            let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flag = cancelled.clone();
+            let reply = if content.is_null() {
+                "invalid HTTP JSON body".to_owned()
+            } else {
+                serde_json::json!({"choices": [{"message": {"content": content.to_string()}}]})
+                    .to_string()
+            };
+            let port = serve_once_with(reply, move || {
+                flag.store(true, std::sync::atomic::Ordering::Release);
+            });
+            let settings = LlmSettings {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                api_key: "test".into(),
+                model: "test".into(),
+                ..LlmSettings::default()
+            };
+            let control = crate::dispatch::TaskControl::with_cancel_flag(cancelled.clone());
+            let result = enhance_regions_in_task(
+                &settings,
+                &[(0, "hello".into())],
+                None,
+                None,
+                &[],
+                &control,
+            );
+            assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                crate::tr!("已取消 AI 编辑")
+            );
+        }
+    }
+
+    #[test]
+    fn region_http_cancellation_survives_a_dropped_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let settings = LlmSettings {
+            base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+            api_key: "test".into(),
+            model: "test".into(),
+            ..LlmSettings::default()
+        };
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut buf = [0u8; 65536];
+            assert!(stream.read(&mut buf).unwrap() > 0);
+            flag.store(true, std::sync::atomic::Ordering::Release);
+            // Drop the connection without any response after cancellation.
+        });
+        let control = crate::dispatch::TaskControl::with_cancel_flag(cancelled);
+        let result =
+            enhance_regions_in_task(&settings, &[(0, "hello".into())], None, None, &[], &control);
+        server.join().unwrap();
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            crate::tr!("已取消 AI 编辑")
+        );
     }
 
     #[test]

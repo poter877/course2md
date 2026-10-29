@@ -620,6 +620,98 @@ pub fn apply_region_edit_checked(
     )
 }
 
+/// A replacement of original text within one speech passage. Offsets are UTF-8
+/// byte offsets (`start..end`, end exclusive) in the expected document, before
+/// any of the batch's replacements are applied. Split cross-passage selections
+/// into one edit per passage; never use offsets into rendered text or translation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectionEdit {
+    pub section: usize,
+    pub speech: usize,
+    pub start: usize,
+    pub end: usize,
+    pub text: String,
+}
+
+/// Atomically replace selected source ranges, preserving all unselected text.
+///
+/// Capture `expected_document_sha256` with `document_revision_for` against the
+/// displayed document before requesting AI results. Callers must map each model
+/// result to its original input range and reject missing or duplicate result IDs.
+/// Edits may arrive in any order; empty, overlapping (including duplicate),
+/// out-of-bounds, and non-character-boundary ranges are rejected as a whole.
+/// Adjacent ranges and empty replacement strings are allowed, provided the note
+/// retains readable text. All coordinates refer to the same original snapshot.
+///
+/// Only passages whose final source text changes lose their old translation.
+/// A no-op batch preserves the previous undo and revision. A changed batch uses
+/// one undo and the existing recoverable transaction for document, markdown,
+/// manifest and existing exports. Cancellation is honored until publication;
+/// once publication starts, the transaction completes or rolls back as a unit.
+pub fn apply_selection_edits_checked(
+    version_dir: &Path,
+    edits: &[SelectionEdit],
+    expected_document_sha256: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<()> {
+    let _lock = begin(version_dir)?;
+    let original = std::fs::read(version_dir.join("document.json"))?;
+    check_cancelled(cancelled)?;
+    check_revision(&original, Some(expected_document_sha256))?;
+    let mut document = parse_document(&original)?;
+    anyhow::ensure!(!edits.is_empty(), crate::tr!("请先在原文中选择文字"));
+
+    let mut ordered: Vec<_> = edits.iter().collect();
+    ordered.sort_by_key(|edit| (edit.section, edit.speech, edit.start, edit.end));
+    // Validate the entire batch against the untouched snapshot. In particular,
+    // a later invalid range must never leave an earlier replacement published.
+    let mut previous: Option<&SelectionEdit> = None;
+    for edit in &ordered {
+        check_cancelled(cancelled)?;
+        let event = document
+            .sections
+            .get(edit.section)
+            .and_then(|section| section.speech.get(edit.speech))
+            .context(crate::tr!("所选原文已失效，请重新选择"))?;
+        anyhow::ensure!(
+            edit.start < edit.end && event.text.get(edit.start..edit.end).is_some(),
+            crate::tr!("所选原文已失效，请重新选择")
+        );
+        if let Some(previous) = previous {
+            anyhow::ensure!(
+                (edit.section, edit.speech) != (previous.section, previous.speech)
+                    || edit.start >= previous.end,
+                crate::tr!("所选原文已失效，请重新选择")
+            );
+        }
+        previous = Some(edit);
+    }
+
+    // Work backwards within each passage so length changes never move any
+    // remaining range. Clear translation only after comparing the final passage,
+    // including batches whose individual replacements cancel each other out.
+    let mut remaining = ordered.as_slice();
+    while let Some(first) = remaining.first() {
+        check_cancelled(cancelled)?;
+        let count = remaining
+            .partition_point(|edit| (edit.section, edit.speech) == (first.section, first.speech));
+        let event = &mut document.sections[first.section].speech[first.speech];
+        let mut text = event.text.clone();
+        for edit in remaining[..count].iter().rev() {
+            check_cancelled(cancelled)?;
+            text.replace_range(edit.start..edit.end, &edit.text);
+        }
+        if text != event.text {
+            event.text = text;
+            event.translation = None;
+        }
+        remaining = &remaining[count..];
+    }
+
+    let control = crate::dispatch::TaskControl::with_cancel_flag(cancelled.clone());
+    save_edit(version_dir, &original, &document, cancelled, &control)
+}
+
 fn apply_region(
     version_dir: &Path,
     section: usize,
@@ -939,6 +1031,192 @@ mod tests {
                 asset.path
             );
         }
+    }
+
+    fn selection_edit(
+        section: usize,
+        speech: usize,
+        start: usize,
+        end: usize,
+        text: &str,
+    ) -> SelectionEdit {
+        SelectionEdit {
+            section,
+            speech,
+            start,
+            end,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn selection_batch_preserves_unselected_unicode_and_metadata_and_undoes_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path(), true);
+        let path = dir.path().join("document.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["extension"] = serde_json::json!({"future": true});
+        value["sections"][0]["speech"] = serde_json::json!([
+            {"start":0.0,"end":1.0,"text":"前🙂中🙂后","translation":"old first","extra":7},
+            {"start":1.0,"end":2.0,"text":"第二段原文","translation":"old second"},
+            {"start":2.0,"end":3.0,"text":"未选段","translation":"untouched"}
+        ]);
+        let mut section = value["sections"][0].clone();
+        section["speech"] = serde_json::json!([
+            {"start":3.0,"end":4.0,"text":"跨节文本","translation":"old third"}
+        ]);
+        value["sections"].as_array_mut().unwrap().push(section);
+        write_json(&path, &value).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let revision =
+            document_revision_for(dir.path(), &load_document(dir.path()).unwrap()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // Unsorted inputs, repeated source words, variable replacement lengths,
+        // multiple ranges in one passage, multiple passages and multiple sections.
+        let edits = [
+            selection_edit(1, 0, 0, 6, "另一节"),
+            selection_edit(0, 0, 10, 14, "好"),
+            selection_edit(0, 1, 3, 6, "三"),
+            selection_edit(0, 0, 3, 7, "更好🙂"),
+        ];
+        apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).unwrap();
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut expected = value;
+        for (section, speech, text) in [
+            (0, 0, "前更好🙂中好后"),
+            (0, 1, "第三段原文"),
+            (1, 0, "另一节文本"),
+        ] {
+            expected["sections"][section]["speech"][speech]["text"] = text.into();
+            expected["sections"][section]["speech"][speech]["translation"] =
+                serde_json::Value::Null;
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(std::fs::read(dir.path().join(BACKUP)).unwrap(), original);
+        undo_in_place_checked(
+            dir.path(),
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert!(!dir.path().join(BACKUP).exists());
+    }
+
+    #[test]
+    fn selection_batch_rejects_every_invalid_range_without_changing_files_or_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        rich_fixture(dir.path());
+        apply_region_edit(dir.path(), 0, 0, "前🙂后", Some("translation")).unwrap();
+        let before = snapshot(dir.path());
+        let revision = document_revision(dir.path()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let valid = selection_edit(0, 0, 0, 3, "changed");
+        let mut batches = vec![Vec::new()];
+        for invalid in [
+            selection_edit(1, 0, 0, 3, "bad section"),
+            selection_edit(0, 1, 0, 3, "bad speech"),
+            selection_edit(0, 0, 3, 3, "empty"),
+            selection_edit(0, 0, 7, 3, "reversed"),
+            selection_edit(0, 0, 3, usize::MAX, "out of bounds"),
+            selection_edit(0, 0, usize::MAX, usize::MAX, "out of bounds"),
+            selection_edit(0, 0, 4, 7, "split start"),
+            selection_edit(0, 0, 3, 6, "split end"),
+            selection_edit(0, 0, 0, 7, "overlap"),
+            valid.clone(),
+        ] {
+            batches.push(vec![valid.clone(), invalid]);
+        }
+        for edits in batches {
+            assert!(
+                apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).is_err(),
+                "accepted invalid batch: {edits:?}"
+            );
+            assert_eq!(snapshot(dir.path()), before);
+            assert!(!dir.path().join(JOURNAL).exists());
+        }
+    }
+
+    #[test]
+    fn selection_batch_refreshes_exports_once_and_preserves_no_op_translation_and_undo() {
+        let dir = tempfile::tempdir().unwrap();
+        rich_fixture(dir.path());
+        apply_region_edit(dir.path(), 0, 0, "hello", Some("old translation")).unwrap();
+        let before = snapshot(dir.path());
+        let revision = document_revision(dir.path()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // Two adjacent replacements that together leave the passage unchanged.
+        let no_op = [
+            selection_edit(0, 0, 0, 1, "he"),
+            selection_edit(0, 0, 1, 2, ""),
+        ];
+        apply_selection_edits_checked(dir.path(), &no_op, &revision, &cancelled).unwrap();
+        assert_eq!(snapshot(dir.path()), before);
+        let edits = [
+            selection_edit(0, 0, 0, 2, "HE"),
+            selection_edit(0, 0, 2, 3, "L"),
+            selection_edit(0, 0, 4, 5, "O!"),
+        ];
+        apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).unwrap();
+        check_consistent(dir.path(), "HELlO!", 3);
+        assert!(
+            load_document(dir.path()).unwrap().sections[0].speech[0]
+                .translation
+                .is_none()
+        );
+        undo_in_place(dir.path()).unwrap();
+        check_consistent(dir.path(), "hello", 4);
+        assert_eq!(
+            load_document(dir.path()).unwrap().sections[0].speech[0]
+                .translation
+                .as_deref(),
+            Some("old translation")
+        );
+    }
+
+    #[test]
+    fn selection_batch_checks_lock_revision_cancellation_and_export_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        rich_fixture(dir.path());
+        let stale = document_revision(dir.path()).unwrap();
+        apply_region_edit(dir.path(), 0, 0, "hello there", None).unwrap();
+        let before = snapshot(dir.path());
+        let revision = document_revision(dir.path()).unwrap();
+        let edits = [selection_edit(0, 0, 0, 5, "goodbye")];
+        let cancelled = Arc::new(AtomicBool::new(false));
+        assert!(apply_selection_edits_checked(dir.path(), &edits, &stale, &cancelled).is_err());
+        let lock = begin(dir.path()).unwrap();
+        assert!(apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).is_err());
+        drop(lock);
+        cancelled.store(true, Ordering::Release);
+        assert!(apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).is_err());
+        assert_eq!(snapshot(dir.path()), before);
+        cancelled.store(false, Ordering::Release);
+        let mut document = load_document(dir.path()).unwrap();
+        document.sections[0].image = "missing.png".into();
+        write_json(&dir.path().join("document.json"), &document).unwrap();
+        let before = snapshot(dir.path());
+        let revision = document_revision(dir.path()).unwrap();
+        assert!(apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).is_err());
+        assert_eq!(snapshot(dir.path()), before);
+        assert!(!dir.path().join(JOURNAL).exists());
+    }
+
+    #[test]
+    fn selection_batch_can_delete_selected_text_but_not_the_last_readable_body() {
+        let dir = tempfile::tempdir().unwrap();
+        rich_fixture(dir.path());
+        let before = snapshot(dir.path());
+        let revision = document_revision(dir.path()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let edits = [selection_edit(0, 0, 0, 5, "")];
+        assert!(apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).is_err());
+        assert_eq!(snapshot(dir.path()), before);
+        let edits = [selection_edit(0, 0, 1, 4, "")];
+        apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).unwrap();
+        check_consistent(dir.path(), "ho", 2);
     }
 
     #[test]

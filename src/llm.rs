@@ -446,7 +446,7 @@ pub fn enhance_regions_in_task(
     }
     let translation_rule = target.map_or_else(String::new, |target| {
         crate::tr!(
-            "translation 用 {} 输出 polished 的译文。",
+            "translation 用 {} 输出原文的完整译文，不省略内容。",
             crate::language::native_name(target)
         )
     });
@@ -488,6 +488,14 @@ pub fn enhance_regions_in_task(
                 seen.insert(edit.id),
                 crate::tr!("编辑结果与选中片段不对应 / Edit ids do not match the selected text")
             );
+            if target.is_some() {
+                anyhow::ensure!(
+                    edit.translation
+                        .as_ref()
+                        .is_some_and(|text| !text.trim().is_empty()),
+                    crate::tr!("服务返回的编辑结构无效 / Invalid edit structure")
+                );
+            }
             let source = expected.get(&edit.id).context(crate::tr!(
                 "编辑结果与选中片段不对应 / Edit ids do not match the selected text"
             ))?;
@@ -1915,6 +1923,56 @@ mod region_tests {
             result.unwrap_err().to_string(),
             crate::tr!("已取消 AI 编辑")
         );
+    }
+
+    #[test]
+    fn selected_translation_requires_every_result_and_maps_reversed_response_ids() {
+        for translation in [
+            serde_json::Value::Null,
+            serde_json::json!("  "),
+            serde_json::json!("第二段译文"),
+        ] {
+            let content = serde_json::json!({"edits": [
+                {"id": 1, "cleaned":"Second paragraph", "translation": translation},
+                {"id": 0, "cleaned":"First paragraph", "translation": "第一段译文"}
+            ]});
+            let reply =
+                serde_json::json!({"choices": [{"message": {"content": content.to_string()}}]});
+            let (address, server) =
+                crate::test_http::serve(vec![crate::test_http::json_response(&reply.to_string())]);
+            let settings = LlmSettings {
+                base_url: format!("{address}/v1"),
+                api_key: "test".into(),
+                model: "test".into(),
+                ..Default::default()
+            };
+            let work = tempfile::tempdir().unwrap();
+            let control =
+                crate::dispatch::TaskControl::open(work.path(), Default::default()).unwrap();
+            let result = enhance_regions_in_task(
+                &settings,
+                &[
+                    (0, "First paragraph".into()),
+                    (1, "Second paragraph".into()),
+                ],
+                None,
+                Some("zh-Hans"),
+                &[],
+                &control,
+            );
+            assert_eq!(server.join().unwrap().len(), 1);
+            let receipts = crate::dispatch::receipts(work.path()).unwrap();
+            if translation == "第二段译文" {
+                let edits = result.unwrap();
+                assert_eq!(edits.iter().map(|edit| edit.id).collect::<Vec<_>>(), [0, 1]);
+                assert_eq!(edits[0].translation.as_deref(), Some("第一段译文"));
+                assert_eq!(edits[1].translation.as_deref(), Some("第二段译文"));
+            } else {
+                assert!(result.is_err());
+                assert_eq!(receipts[0].state, crate::dispatch::State::Failed);
+                assert!(receipts[0].response.is_none());
+            }
+        }
     }
 
     #[test]

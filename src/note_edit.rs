@@ -514,6 +514,12 @@ fn save_edit(
         for (j, speech) in section.speech.iter().enumerate() {
             let old = &before.sections[i].speech[j];
             let target = &mut value["sections"][i]["speech"][j];
+            if old.text != speech.text || old.translation != speech.translation {
+                target
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("selection_translations");
+            }
             if old.text != speech.text {
                 target["text"] = speech.text.clone().into();
             }
@@ -659,6 +665,38 @@ pub fn apply_selection_edits_checked(
     check_cancelled(cancelled)?;
     check_revision(&original, Some(expected_document_sha256))?;
     let mut document = parse_document(&original)?;
+    let ordered = checked_selection_edits(&document, edits, cancelled)?;
+
+    // Work backwards within each passage so length changes never move any
+    // remaining range. Clear translation only after comparing the final passage,
+    // including batches whose individual replacements cancel each other out.
+    let mut remaining = ordered.as_slice();
+    while let Some(first) = remaining.first() {
+        check_cancelled(cancelled)?;
+        let count = remaining
+            .partition_point(|edit| (edit.section, edit.speech) == (first.section, first.speech));
+        let event = &mut document.sections[first.section].speech[first.speech];
+        let mut text = event.text.clone();
+        for edit in remaining[..count].iter().rev() {
+            check_cancelled(cancelled)?;
+            text.replace_range(edit.start..edit.end, &edit.text);
+        }
+        if text != event.text {
+            event.text = text;
+            event.translation = None;
+        }
+        remaining = &remaining[count..];
+    }
+
+    let control = crate::dispatch::TaskControl::with_cancel_flag(cancelled.clone());
+    save_edit(version_dir, &original, &document, cancelled, &control)
+}
+
+fn checked_selection_edits<'a>(
+    document: &crate::artifact::Document,
+    edits: &'a [SelectionEdit],
+    cancelled: &AtomicBool,
+) -> Result<Vec<&'a SelectionEdit>> {
     anyhow::ensure!(!edits.is_empty(), crate::tr!("请先在原文中选择文字"));
 
     let mut ordered: Vec<_> = edits.iter().collect();
@@ -687,29 +725,126 @@ pub fn apply_selection_edits_checked(
         previous = Some(edit);
     }
 
-    // Work backwards within each passage so length changes never move any
-    // remaining range. Clear translation only after comparing the final passage,
-    // including batches whose individual replacements cancel each other out.
+    Ok(ordered)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TranslationPart {
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelectionTranslations {
+    schema: u8,
+    source_sha256: String,
+    base: Option<String>,
+    parts: Vec<TranslationPart>,
+    rendered: String,
+}
+
+/// Translate exact selected source ranges without replacing source text.
+/// `SelectionEdit.text` contains the translated text. All passages commit and
+/// undo together. Full-passage results use the existing bilingual field. Partial
+/// results retain any existing full translation and carry explicit source quotes.
+/// The auxiliary ranges let a repeat translation replace its own previous result;
+/// `translation` remains readable by existing readers and every export format.
+pub fn apply_selection_translations_checked(
+    version_dir: &Path,
+    edits: &[SelectionEdit],
+    expected_document_sha256: &str,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<()> {
+    let _lock = begin(version_dir)?;
+    let original = std::fs::read(version_dir.join("document.json"))?;
+    check_cancelled(cancelled)?;
+    check_revision(&original, Some(expected_document_sha256))?;
+    let document = parse_document(&original)?;
+    let ordered = checked_selection_edits(&document, edits, cancelled)?;
+    anyhow::ensure!(
+        edits.iter().all(|edit| !edit.text.trim().is_empty()),
+        crate::tr!("服务返回的编辑结构无效 / Invalid edit structure")
+    );
+    let mut value: serde_json::Value = serde_json::from_slice(&original)?;
+    let before = value.clone();
     let mut remaining = ordered.as_slice();
     while let Some(first) = remaining.first() {
         check_cancelled(cancelled)?;
         let count = remaining
             .partition_point(|edit| (edit.section, edit.speech) == (first.section, first.speech));
-        let event = &mut document.sections[first.section].speech[first.speech];
-        let mut text = event.text.clone();
-        for edit in remaining[..count].iter().rev() {
-            check_cancelled(cancelled)?;
-            text.replace_range(edit.start..edit.end, &edit.text);
-        }
-        if text != event.text {
-            event.text = text;
-            event.translation = None;
+        let event = &document.sections[first.section].speech[first.speech];
+        let target = &mut value["sections"][first.section]["speech"][first.speech];
+        if count == 1 && first.start == 0 && first.end == event.text.len() {
+            target["translation"] = first.text.trim().into();
+            target
+                .as_object_mut()
+                .unwrap()
+                .remove("selection_translations");
+        } else {
+            let digest = crate::execution::digest(event.text.as_bytes());
+            let mut saved = if let Some(saved) = target.get("selection_translations") {
+                let saved: SelectionTranslations = serde_json::from_value(saved.clone())
+                    .context(crate::tr!("笔记正文无法读取，原文件已保留"))?;
+                anyhow::ensure!(
+                    saved.schema == 1
+                        && saved.source_sha256 == digest
+                        && event.translation.as_deref() == Some(saved.rendered.as_str())
+                        && saved.parts.iter().all(|part| part.start < part.end
+                            && event.text.get(part.start..part.end).is_some()
+                            && !part.text.trim().is_empty())
+                        && saved
+                            .parts
+                            .windows(2)
+                            .all(|pair| pair[0].end <= pair[1].start),
+                    crate::tr!("笔记正文无法读取，原文件已保留")
+                );
+                saved
+            } else {
+                SelectionTranslations {
+                    schema: 1,
+                    source_sha256: digest,
+                    base: event.translation.clone(),
+                    parts: Vec::new(),
+                    rendered: String::new(),
+                }
+            };
+            for edit in &remaining[..count] {
+                saved
+                    .parts
+                    .retain(|part| part.end <= edit.start || part.start >= edit.end);
+                saved.parts.push(TranslationPart {
+                    start: edit.start,
+                    end: edit.end,
+                    text: edit.text.trim().to_owned(),
+                });
+            }
+            saved.parts.sort_by_key(|part| part.start);
+            let mut rendered: Vec<String> = saved.base.iter().cloned().collect();
+            for part in &saved.parts {
+                rendered.push(format!(
+                    "{}\n{}",
+                    crate::tr!("选区译文（原文：{}）", &event.text[part.start..part.end]),
+                    part.text
+                ));
+            }
+            saved.rendered = rendered.join("\n\n");
+            target["translation"] = saved.rendered.clone().into();
+            target["selection_translations"] = serde_json::to_value(saved)?;
         }
         remaining = &remaining[count..];
     }
-
+    if value == before {
+        return Ok(());
+    }
+    let bytes = serde_json::to_vec_pretty(&value)?;
+    let document = parse_document(&bytes)?;
     let control = crate::dispatch::TaskControl::with_cancel_flag(cancelled.clone());
-    save_edit(version_dir, &original, &document, cancelled, &control)
+    let stage = prepare(version_dir, &bytes, &document, Some(&original), &control)?;
+    check_cancelled(cancelled)?;
+    commit(version_dir, stage)
 }
 
 fn apply_region(
@@ -1217,6 +1352,480 @@ mod tests {
         let edits = [selection_edit(0, 0, 1, 4, "")];
         apply_selection_edits_checked(dir.path(), &edits, &revision, &cancelled).unwrap();
         check_consistent(dir.path(), "ho", 2);
+    }
+
+    fn selection_translation_fixture(dir: &Path) -> serde_json::Value {
+        rich_fixture(dir);
+        let path = dir.join("document.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["extension"] = serde_json::json!({"future": true});
+        value["sections"][0]["speech"] = serde_json::json!([
+            {"start":0.0,"end":1.0,"text":"前🙂中🙂后","raw":"original raw 🙂",
+             "translation":"seed translation","extra":{"keep":7}},
+            {"start":1.0,"end":2.0,"text":"Second full passage.","raw":"second raw",
+             "translation":"old second translation"},
+            {"start":2.0,"end":3.0,"text":"未选段","raw":"untouched raw",
+             "translation":"untouched translation"}
+        ]);
+        let mut section = value["sections"][0].clone();
+        section["t"] = 3.0.into();
+        section["end"] = 4.0.into();
+        section["speech"] = serde_json::json!([
+            {"start":3.0,"end":4.0,"text":"跨节文本","raw":"cross-section raw"}
+        ]);
+        value["sections"].as_array_mut().unwrap().push(section);
+        write_json(&path, &value).unwrap();
+        // Publish a coherent baseline, including exports and a previous undo.
+        apply_region_edit(dir, 0, 0, "前🙂中🙂后", Some("old full translation")).unwrap();
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn selection_translations_preserve_source_raw_and_full_translation_and_undo_as_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = selection_translation_fixture(dir.path());
+        let path = dir.path().join("document.json");
+        let original_bytes = std::fs::read(&path).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let edits = [
+            selection_edit(1, 0, 0, 6, "cross-section translation"),
+            selection_edit(0, 0, 10, 14, "second emoji translation"),
+            selection_edit(0, 1, 0, "Second full passage.".len(), " full replacement "),
+            selection_edit(0, 0, 3, 7, "first emoji translation"),
+        ];
+        apply_selection_translations_checked(
+            dir.path(),
+            &edits,
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let first = &actual["sections"][0]["speech"][0];
+        let translation = first["translation"].as_str().unwrap();
+        assert!(translation.starts_with("old full translation\n\n"));
+        assert!(
+            translation.find("first emoji translation").unwrap()
+                < translation.find("second emoji translation").unwrap()
+        );
+        assert_eq!(
+            first["selection_translations"]["base"],
+            "old full translation"
+        );
+        assert_eq!(
+            first["selection_translations"]["parts"],
+            serde_json::json!([
+                {"start":3,"end":7,"text":"first emoji translation"},
+                {"start":10,"end":14,"text":"second emoji translation"}
+            ])
+        );
+        assert_eq!(
+            actual["sections"][0]["speech"][1]["translation"],
+            "full replacement"
+        );
+        assert!(
+            actual["sections"][0]["speech"][1]
+                .get("selection_translations")
+                .is_none()
+        );
+        assert!(actual["sections"][1]["speech"][0]["selection_translations"]["base"].is_null());
+        // Compare every source/raw/timing/extension field, including unselected passages.
+        let mut restored_fields = actual.clone();
+        for (section, speech) in [(0, 0), (0, 1), (1, 0)] {
+            let target = restored_fields["sections"][section]["speech"][speech]
+                .as_object_mut()
+                .unwrap();
+            target.remove("selection_translations");
+            target.remove("translation");
+            if let Some(old) = original["sections"][section]["speech"][speech].get("translation") {
+                target.insert("translation".into(), old.clone());
+            }
+        }
+        assert_eq!(restored_fields, original);
+        check_consistent(dir.path(), "前🙂中🙂后", 3);
+        for name in [
+            "course.md",
+            "exports/course.html",
+            "exports/structured.json",
+        ] {
+            let export = std::fs::read_to_string(dir.path().join(name)).unwrap();
+            for text in [
+                "old full translation",
+                "first emoji translation",
+                "second emoji translation",
+                "full replacement",
+                "cross-section translation",
+            ] {
+                assert!(export.contains(text), "{name} omitted {text}");
+            }
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join(BACKUP)).unwrap(),
+            original_bytes
+        );
+        undo_in_place_checked(
+            dir.path(),
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        check_consistent(dir.path(), "前🙂中🙂后", 4);
+        assert!(!dir.path().join(BACKUP).exists());
+        let restored = snapshot(dir.path());
+        assert!(undo_in_place(dir.path()).is_err());
+        assert_eq!(snapshot(dir.path()), restored);
+    }
+
+    #[test]
+    fn selection_translations_replace_repeated_ranges_and_full_passage_supersedes_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        selection_translation_fixture(dir.path());
+        let path = dir.path().join("document.json");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let initial = [
+            selection_edit(0, 0, 3, 7, "old partial"),
+            selection_edit(0, 0, 10, 14, "keep partial"),
+        ];
+        apply_selection_translations_checked(
+            dir.path(),
+            &initial,
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        let replacement = [selection_edit(0, 0, 3, 7, "replacement partial")];
+        apply_selection_translations_checked(
+            dir.path(),
+            &replacement,
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        let partial_bytes = std::fs::read(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&partial_bytes).unwrap();
+        let event = &value["sections"][0]["speech"][0];
+        assert_eq!(
+            event["selection_translations"]["parts"],
+            serde_json::json!([
+                {"start":3,"end":7,"text":"replacement partial"},
+                {"start":10,"end":14,"text":"keep partial"}
+            ])
+        );
+        let rendered = event["translation"].as_str().unwrap();
+        assert!(!rendered.contains("old partial"));
+        for text in [
+            "old full translation",
+            "replacement partial",
+            "keep partial",
+        ] {
+            assert_eq!(rendered.matches(text).count(), 1);
+        }
+        let before = snapshot(dir.path());
+        apply_selection_translations_checked(
+            dir.path(),
+            &replacement,
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot(dir.path()),
+            before,
+            "identical translation must retain revision and undo"
+        );
+        let full = [selection_edit(
+            0,
+            0,
+            0,
+            "前🙂中🙂后".len(),
+            "new full translation",
+        )];
+        apply_selection_translations_checked(
+            dir.path(),
+            &full,
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let event = &value["sections"][0]["speech"][0];
+        assert_eq!(event["translation"], "new full translation");
+        assert_eq!(event["text"], "前🙂中🙂后");
+        assert_eq!(event["raw"], "original raw 🙂");
+        assert!(event.get("selection_translations").is_none());
+        undo_in_place(dir.path()).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), partial_bytes);
+    }
+
+    #[test]
+    fn selection_translations_reject_invalid_metadata_without_publishing_earlier_passages() {
+        let dir = tempfile::tempdir().unwrap();
+        selection_translation_fixture(dir.path());
+        let cancelled = Arc::new(AtomicBool::new(false));
+        apply_selection_translations_checked(
+            dir.path(),
+            &[selection_edit(1, 0, 0, 3, "prior partial")],
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        let path = dir.path().join("document.json");
+        let valid: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let metadata = valid["sections"][1]["speech"][0]["selection_translations"].clone();
+        let mut corruptions = vec![
+            ("null metadata", serde_json::Value::Null),
+            ("missing fields", serde_json::json!({})),
+        ];
+        for (key, replacement) in [
+            ("schema", serde_json::json!(2)),
+            ("source_sha256", serde_json::json!("stale source digest")),
+            (
+                "rendered",
+                serde_json::json!("different visible translation"),
+            ),
+            ("base", serde_json::json!(42)),
+            ("unknown_field", serde_json::json!(true)),
+        ] {
+            let mut invalid = metadata.clone();
+            invalid[key] = replacement;
+            corruptions.push((key, invalid));
+        }
+        for (label, parts) in [
+            (
+                "split UTF-8 start",
+                serde_json::json!([{"start":1,"end":3,"text":"x"}]),
+            ),
+            (
+                "split UTF-8 end",
+                serde_json::json!([{"start":0,"end":2,"text":"x"}]),
+            ),
+            (
+                "out of bounds",
+                serde_json::json!([{"start":0,"end":99,"text":"x"}]),
+            ),
+            (
+                "empty range",
+                serde_json::json!([{"start":3,"end":3,"text":"x"}]),
+            ),
+            (
+                "reversed range",
+                serde_json::json!([{"start":6,"end":3,"text":"x"}]),
+            ),
+            (
+                "empty translation",
+                serde_json::json!([{"start":0,"end":3,"text":" \n\t"}]),
+            ),
+            (
+                "overlap",
+                serde_json::json!([{"start":0,"end":6,"text":"x"},{"start":3,"end":9,"text":"y"}]),
+            ),
+            (
+                "duplicate range",
+                serde_json::json!([{"start":0,"end":3,"text":"x"},{"start":0,"end":3,"text":"y"}]),
+            ),
+            (
+                "reversed order",
+                serde_json::json!([{"start":6,"end":9,"text":"x"},{"start":0,"end":3,"text":"y"}]),
+            ),
+        ] {
+            let mut invalid = metadata.clone();
+            invalid["parts"] = parts;
+            corruptions.push((label, invalid));
+        }
+        for (label, invalid) in corruptions {
+            let mut document = valid.clone();
+            document["sections"][1]["speech"][0]["selection_translations"] = invalid;
+            write_json(&path, &document).unwrap();
+            let before = snapshot(dir.path());
+            let edits = [
+                selection_edit(0, 0, 3, 7, "must not publish"),
+                selection_edit(1, 0, 6, 9, "also not published"),
+            ];
+            assert!(
+                apply_selection_translations_checked(
+                    dir.path(),
+                    &edits,
+                    &document_revision(dir.path()).unwrap(),
+                    &cancelled
+                )
+                .is_err(),
+                "accepted {label}"
+            );
+            assert_eq!(snapshot(dir.path()), before, "wrote files for {label}");
+            assert!(!dir.path().join(JOURNAL).exists());
+        }
+    }
+
+    #[test]
+    fn selection_translations_reject_invalid_ranges_empty_results_and_cancel_without_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        selection_translation_fixture(dir.path());
+        let before = snapshot(dir.path());
+        let revision = document_revision(dir.path()).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let valid = selection_edit(0, 0, 0, 3, "valid translation");
+        let mut batches = vec![vec![]];
+        for invalid in [
+            selection_edit(99, 0, 0, 3, "bad section"),
+            selection_edit(0, 99, 0, 3, "bad passage"),
+            selection_edit(0, 0, 4, 7, "split start"),
+            selection_edit(0, 0, 3, 6, "split end"),
+            selection_edit(0, 0, 3, 3, "empty range"),
+            selection_edit(0, 0, 7, 3, "reversed range"),
+            selection_edit(0, 0, 3, usize::MAX, "out of bounds"),
+            selection_edit(0, 0, 0, 7, "overlap"),
+            selection_edit(1, 0, 0, 6, ""),
+            selection_edit(1, 0, 0, 6, " \n\t　"),
+            valid.clone(),
+        ] {
+            batches.push(vec![valid.clone(), invalid]);
+        }
+        for edits in batches {
+            assert!(
+                apply_selection_translations_checked(dir.path(), &edits, &revision, &cancelled)
+                    .is_err(),
+                "accepted {edits:?}"
+            );
+            assert_eq!(snapshot(dir.path()), before);
+            assert!(!dir.path().join(JOURNAL).exists());
+        }
+        cancelled.store(true, Ordering::Release);
+        assert!(
+            apply_selection_translations_checked(
+                dir.path(),
+                std::slice::from_ref(&valid),
+                &revision,
+                &cancelled
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(dir.path()), before);
+        cancelled.store(false, Ordering::Release);
+        assert!(
+            apply_selection_translations_checked(
+                dir.path(),
+                &[valid],
+                "stale revision",
+                &cancelled
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(dir.path()), before);
+        assert!(!dir.path().join(JOURNAL).exists());
+    }
+
+    #[test]
+    fn selection_translations_source_edits_clear_only_changed_passage_metadata() {
+        for use_selection_edit in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            selection_translation_fixture(dir.path());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let parts = [
+                selection_edit(0, 0, 3, 7, "first partial"),
+                selection_edit(1, 0, 0, 6, "cross partial"),
+            ];
+            apply_selection_translations_checked(
+                dir.path(),
+                &parts,
+                &document_revision(dir.path()).unwrap(),
+                &cancelled,
+            )
+            .unwrap();
+            let path = dir.path().join("document.json");
+            let original_bytes = std::fs::read(&path).unwrap();
+            let original: serde_json::Value = serde_json::from_slice(&original_bytes).unwrap();
+            let before = snapshot(dir.path());
+            apply_selection_edits_checked(
+                dir.path(),
+                &[selection_edit(0, 0, 3, 7, "🙂")],
+                &document_revision(dir.path()).unwrap(),
+                &cancelled,
+            )
+            .unwrap();
+            assert_eq!(
+                snapshot(dir.path()),
+                before,
+                "no-op source edits must retain translation metadata"
+            );
+            if use_selection_edit {
+                apply_selection_edits_checked(
+                    dir.path(),
+                    &[selection_edit(0, 0, 3, 7, "新")],
+                    &document_revision(dir.path()).unwrap(),
+                    &cancelled,
+                )
+                .unwrap();
+            } else {
+                apply_region_edit(dir.path(), 0, 0, "前新中🙂后", None).unwrap();
+            }
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let first = &value["sections"][0]["speech"][0];
+            assert_eq!(first["text"], "前新中🙂后");
+            assert_eq!(first["raw"], "original raw 🙂");
+            assert!(first["translation"].is_null());
+            assert!(first.get("selection_translations").is_none());
+            assert_eq!(value["sections"][1], original["sections"][1]);
+            undo_in_place(dir.path()).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+        }
+    }
+
+    #[test]
+    fn selection_batch_deletes_whole_passages_and_cross_passage_ranges_then_undoes() {
+        let dir = tempfile::tempdir().unwrap();
+        let original = selection_translation_fixture(dir.path());
+        let path = dir.path().join("document.json");
+        let original_bytes = std::fs::read(&path).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let edits = [
+            selection_edit(1, 0, 0, "跨节文本".len(), ""),
+            selection_edit(0, 1, 0, "Second".len(), ""),
+            selection_edit(0, 0, 0, "前🙂中🙂后".len(), ""),
+        ];
+        apply_selection_edits_checked(
+            dir.path(),
+            &edits,
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        let actual: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let mut expected = original;
+        for (section, speech, text) in [(0, 0, ""), (0, 1, " full passage."), (1, 0, "")] {
+            expected["sections"][section]["speech"][speech]["text"] = text.into();
+            if expected["sections"][section]["speech"][speech]
+                .get("translation")
+                .is_some()
+            {
+                expected["sections"][section]["speech"][speech]["translation"] =
+                    serde_json::Value::Null;
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(
+            load_document(dir.path()).unwrap().sections[0].speech[2].text,
+            "未选段"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(BACKUP)).unwrap(),
+            original_bytes
+        );
+        undo_in_place_checked(
+            dir.path(),
+            &document_revision(dir.path()).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original_bytes);
+        check_consistent(dir.path(), "前🙂中🙂后", 4);
+        assert!(!dir.path().join(BACKUP).exists());
     }
 
     #[test]

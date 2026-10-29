@@ -2207,12 +2207,10 @@ Intel NPU 不再支持 Qwen3 模型。可用：{}	Intel NPU 不再支持 Qwen3 �
 启用 AI 处理	启用 AI 处理	Enable AI processing	啟用 AI 處理	AI 処理を有効にする
 视频画面（无对应幻灯片）	视频画面（无对应幻灯片）	Video screen (no matching slide)	影片畫面（無對應投影片）	映像画面（対応スライドなし）
 AI 翻译整篇	AI 翻译整篇	Translate whole note with AI	AI 翻譯整篇	AI でノート全体を翻訳
-撤销这次 AI 编辑	撤销这次 AI 编辑	Undo this AI edit	撤銷這次 AI 編輯	この AI 編集を元に戻す
 正在翻译整篇笔记…	正在翻译整篇笔记…	Translating the whole note…	正在翻譯整篇筆記…	ノート全体を翻訳しています…
 已翻译 {}/{} 段	已翻译 {}/{} 段	Translated {}/{} passages	已翻譯 {}/{} 段	{}/{} 段落を翻訳しました
 翻译时意外中断，请重试	翻译时意外中断，请重试	Translation was interrupted; try again	翻譯時意外中斷，請重試	翻訳が中断されました。再試行してください
 撤销时意外中断，请重试	撤销时意外中断，请重试	Undo was interrupted; try again	撤銷時意外中斷，請重試	元に戻す処理が中断されました。再試行してください
-已撤销这次 AI 编辑	已撤销这次 AI 编辑	AI edit undone	已撤銷這次 AI 編輯	この AI 編集を元に戻しました
 这份笔记没有可撤销的 AI 编辑 / No AI edit to undo	这份笔记没有可撤销的 AI 编辑 / No AI edit to undo	This note has no AI edit to undo	這份筆記沒有可撤銷的 AI 編輯 / No AI edit to undo	このノートには元に戻せる AI 編集がありません
 AI 处理本段	AI 处理本段	AI edit this paragraph	AI 處理本段	この段落を AI 編集
 AI 清理语气词	AI 清理语气词	Remove filler words	AI 清理語氣詞	フィラーを削除
@@ -2225,10 +2223,9 @@ AI 优化本段	AI 优化本段	Improve this paragraph	AI 優化本段	この段
 润色文字，保持原意与术语，不新增事实。	润色文字，保持原意与术语，不新增事实。	Polish the text while keeping its meaning and terms; add no new facts.	潤色文字，保持原意與術語，不新增事實。	表現を整え、意味と用語を保つ。新しい事実は追加しない。
 把原文翻译为目标语言，不改写原文。	把原文翻译为目标语言，不改写原文。	Translate into the target language without rewriting the source.	把原文翻譯為目標語言，不改寫原文。	原文を目標言語に翻訳し、原文は改写しない。
 处理本段时意外中断，请重试	处理本段时意外中断，请重试	Editing was interrupted; try again	處理本段時意外中斷，請重試	段落の処理が中断されました。再試行してください
-translation 用 {} 输出 polished 的译文。	translation 用 {} 输出 polished 的译文。	Write the polished text's translation in {}.	translation 用 {} 輸出 polished 的譯文。	translation は {} で polished の訳文を出力する。
+translation 用 {} 输出原文的完整译文，不省略内容。	translation 用 {} 输出原文的完整译文，不省略内容。	Use {} for translation of the complete source text without omissions.	translation 用 {} 輸出原文的完整譯文，不省略內容。	translation には原文を省略せず全文の {} 訳を出力してください。
 无法读取图片	无法读取图片	Cannot read the image	無法讀取圖片	画像を読み込めません
 附带图片只用于理解原文，不要描述图片本身。	附带图片只用于理解原文，不要描述图片本身。	Attached images are only for understanding the text; do not describe the images.	附帶圖片只用於理解原文，不要描述圖片本身。	添付画像は原文の理解のみに使い、画像自体の説明はしない。
-取消 AI 编辑	取消 AI 编辑	Cancel AI edit	取消 AI 編輯	AI 編集をキャンセル
 已取消 AI 编辑	已取消 AI 编辑	AI edit cancelled	已取消 AI 編輯	AI 編集をキャンセルしました
 AI 预览 · {}	AI 预览 · {}	AI preview · {}	AI 預覽 · {}	AI プレビュー · {}
 结果：{}	结果：{}	Result: {}	結果：{}	結果：{}
@@ -2342,3 +2339,17 @@ AI 处理选中文字	AI 处理选中文字	AI edit selection	AI 處理選取文
 下一页	下一页	Next page	下一頁	次のページ
 复制	复制	Copy	複製	コピー
 开始	开始	Start	開始	開始
+AI 翻译选中文字	AI 翻译选中文字	Translate selected text with AI	AI 翻譯選取文字	選択したテキストをAIで翻訳
+选区译文（原文：{}）	选区译文（原文：{}）	Selection translation (source: {})	選取範圍譯文（原文：{}）	選択範囲の訳文（原文：{}）
+修改选中文字…	修改选中文字…	Edit selected text…	修改選取文字…	選択したテキストを編集…
+删除选中文字…	删除选中文字…	Delete selected text…	刪除選取文字…	選択したテキストを削除…
+修改本段…	修改本段…	Edit this paragraph…	修改本段…	この段落を編集…
+删除本段…	删除本段…	Delete this paragraph…	刪除本段…	この段落を削除…
+修改选中文字	修改选中文字	Edit selected text	修改選取文字	選択したテキストを編集
+删除选中文字	删除选中文字	Delete selected text	刪除選取文字	選択したテキストを削除
+一次最多修改或删除 {} 段选中文字，请缩小选区后重试	一次最多修改或删除 {} 段选中文字，请缩小选区后重试	You can edit or delete up to {} selected passages at once. Select fewer passages and try again.	一次最多修改或刪除 {} 段選取文字，請縮小選取範圍後重試	一度に編集・削除できるのは {} 段落までです。選択範囲を狭めて再試行してください
+撤销上次修改	撤销上次修改	Undo last edit	撤銷上次修改	前回の編集を元に戻す
+已撤销上次修改	已撤销上次修改	Last edit undone	已撤銷上次修改	前回の編集を元に戻しました
+取消修改	取消修改	Cancel edit	取消修改	編集をキャンセル
+已取消修改	已取消修改	Edit cancelled	已取消修改	編集をキャンセルしました
+AI 翻译图片对应文字	AI 翻译图片对应文字	Translate text for selected images	AI 翻譯圖片對應文字	選択した画像に対応するテキストを翻訳

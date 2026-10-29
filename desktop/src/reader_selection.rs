@@ -121,11 +121,7 @@ impl Desktop {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.page != Page::Result
-            || self.reading
-            || self.reader_ui.ai_edit.busy()
-            || !matches!(mode, AiRegionMode::Clean | AiRegionMode::Polish)
-        {
+        if self.page != Page::Result || self.reading || self.reader_ui.ai_edit.busy() {
             return;
         }
         let Some(preview) = self.preview.as_ref() else {
@@ -349,7 +345,7 @@ impl Render for SelectionEditor {
         let mode = match self.mode {
             AiRegionMode::Clean => course2md::tr!("清理语气词"),
             AiRegionMode::Polish => course2md::tr!("优化"),
-            AiRegionMode::Translate => unreachable!("selection editor only accepts clean/polish"),
+            AiRegionMode::Translate => course2md::tr!("翻译"),
         };
         let mut gallery = h_flex().w_full().min_w_0().flex_wrap().gap_3();
         for index in start..end {

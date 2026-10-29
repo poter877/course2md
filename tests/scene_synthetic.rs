@@ -63,6 +63,7 @@ fn test_cfg(video: &Path, dir: &Path) -> course2md::config::PipelineConfig {
         mmproj_offload: true,
         transcript_source: course2md::config::TranscriptSource::Asr,
         subtitle_file: None,
+        subtitle_offset: 0.0,
         slides: Vec::new(),
         slide_match_threshold: course2md::config::DEFAULT_SLIDE_MATCH_THRESHOLD,
     }

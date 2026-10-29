@@ -2200,7 +2200,7 @@ Intel NPU 不再支持 Qwen3 模型。可用：{}	Intel NPU 不再支持 Qwen3 �
 添加幻灯片 PDF	添加幻灯片 PDF	Add slide PDFs	新增投影片 PDF	スライド PDF を追加
 选择幻灯片 PDF（可多选）	选择幻灯片 PDF（可多选）	Choose slide PDFs (multiple allowed)	選擇投影片 PDF（可多選）	スライド PDF を選択（複数可）
 还没添加幻灯片 PDF	还没添加幻灯片 PDF	No slide PDFs added yet	尚未新增投影片 PDF	スライド PDF は未追加です
-给出 PDF 时，视频只用来判断翻页；成图与页码改用 PDF 页。	给出 PDF 时，视频只用来判断翻页；成图与页码改用 PDF 页。	With PDFs, the video only detects page changes; images and page numbers come from the PDF.	給出 PDF 時，影片只用來判斷翻頁；成圖與頁碼改用 PDF 頁。	PDF を指定すると、動画はページ送りの検出だけに使い、画像とページ番号は PDF から取ります。
+可靠匹配的页面使用 PDF；其余保留视频截图。	可靠匹配的页面使用 PDF；其余保留视频截图。	Reliably matched pages use the PDF; other scenes keep their video screenshots.	可靠匹配的頁面使用 PDF；其餘保留影片截圖。	確実に一致するページは PDF を使い、それ以外は動画のスクリーンショットを残します。
 移除	移除	Remove	移除	削除
 关闭后不运行校对、摘要、截图辅助与翻译	关闭后不运行校对、摘要、截图辅助与翻译	When off, proofreading, summaries, image-assisted proofreading and translation do not run	關閉後不執行校對、摘要、截圖輔助與翻譯	オフにすると校正・要約・画像補助・翻訳を実行しません
 已在设置中关闭 AI 处理：不运行校对、摘要、截图辅助与翻译。	已在设置中关闭 AI 处理：不运行校对、摘要、截图辅助与翻译。	AI processing is off in Settings: proofreading, summaries, image-assisted proofreading and translation will not run.	已在設定中關閉 AI 處理：不執行校對、摘要、截圖輔助與翻譯。	設定で AI 処理をオフにしています：校正・要約・画像補助・翻訳は実行されません。
@@ -2259,3 +2259,17 @@ AI 优化本段（带本段截图）	AI 优化本段（带本段截图）	Improv
 外部工具 {} 执行失败（退出码 {}）：{}	外部工具 {} 执行失败（退出码 {}）：{}	External tool {} failed (exit code {}): {}	外部工具 {} 執行失敗（結束代碼 {}）：{}	外部ツール {} の実行に失敗しました（終了コード {}）：{}
 幻灯片临时路径无效	幻灯片临时路径无效	The slide temporary path is invalid.	投影片暫存路徑無效	スライドの一時パスが無効です。
 笔记内容已变化，请重新打开后再试	笔记内容已变化，请重新打开后再试	The note has changed. Reopen it and retry.	筆記內容已變更，請重新開啟後再試	ノートの内容が変更されました。開き直して再試行してください。
+请输入有效秒数，例如 -1.5 或 2	请输入有效秒数，例如 -1.5 或 2	Enter a valid number of seconds, such as -1.5 or 2	請輸入有效秒數，例如 -1.5 或 2	有効な秒数を入力してください（例：-1.5、2）
+当前视频已变化，请重新调整字幕时间	当前视频已变化，请重新调整字幕时间	The current video has changed. Adjust subtitle timing again.	目前影片已變更，請重新調整字幕時間	動画が変更されました。字幕のタイミングを調整し直してください。
+首条字幕开始：{} 秒 → {} 秒	首条字幕开始：{} 秒 → {} 秒	First subtitle starts: {} s → {} s	首條字幕開始：{} 秒 → {} 秒	最初の字幕の開始：{} 秒 → {} 秒
+偏移秒数	偏移秒数	Offset in seconds	偏移秒數	調整する秒数
+正数延后，负数提前；仅应用于当前视频的字幕。	正数延后，负数提前；仅应用于当前视频的字幕。	Positive values delay subtitles; negative values advance them. Applies only to this video.	正數延後，負數提前；僅套用於目前影片的字幕。	正の値で字幕を遅らせ、負の値で早めます。この動画の字幕にのみ適用します。
+调整字幕时间	调整字幕时间	Adjust subtitle timing	調整字幕時間	字幕のタイミングを調整
+字幕偏移：{} 秒	字幕偏移：{} 秒	Subtitle offset: {} s	字幕偏移：{} 秒	字幕の調整：{} 秒
+首条字幕移到视频开始前，将被跳过	首条字幕移到视频开始前，将被跳过	The first subtitle falls before the video and will be skipped.	首條字幕移到影片開始前，將被跳過	最初の字幕は動画の開始前になるため、スキップされます。
+字幕偏移（秒）：正数延后，负数提前；不影响语音识别 / Subtitle offset in seconds: positive delays, negative advances; does not affect ASR	字幕偏移（秒）：正数延后，负数提前；不影响语音识别	Subtitle offset in seconds: positive delays, negative advances; does not affect ASR	字幕偏移（秒）：正數延後，負數提前；不影響語音辨識	字幕の調整（秒）：正は遅延、負は前倒し。音声認識には影響しません
+当前字幕已变化，请重新打开时间调整	当前字幕已变化，请重新打开时间调整	The subtitles have changed. Reopen timing adjustment.	目前字幕已變更，請重新開啟時間調整	字幕が変更されました。時間調整を開き直してください
+调整后没有可用字幕，请检查偏移秒数	调整后没有可用字幕，请检查偏移秒数	No subtitles remain after adjustment. Check the offset.	調整後沒有可用字幕，請檢查偏移秒數	調整後に有効な字幕が残りません。オフセットを確認してください
+外部幻灯片 PDF：可靠匹配使用 PDF 页，其余保留视频截图（可重复，按顺序编号 deck）	外部幻灯片 PDF：可靠匹配使用 PDF 页，其余保留视频截图（可重复，按顺序编号 deck）	Slide PDF: use reliably matched pages, otherwise keep video screenshots (repeatable; decks follow input order)	外部投影片 PDF：可靠匹配使用 PDF 頁，其餘保留影片截圖（可重複，依順序編號 deck）	スライド PDF：確実に一致するページを使い、それ以外は動画の画像を残す（複数指定可、指定順に資料番号を付与）
+外部字幕文件（SRT/VTT），优先于平台字幕与同名旁挂字幕	外部字幕文件（SRT/VTT），优先于平台字幕与同名旁挂字幕	Subtitle file (SRT/VTT), preferred over platform subtitles and same-name sidecar files	外部字幕檔案（SRT/VTT），優先於平台字幕與同名附加字幕	字幕ファイル（SRT/VTT）。配信元の字幕や同名の字幕ファイルより優先
+PDF 匹配结果的视觉复核阈值 (0,1]，默认 0.35	PDF 匹配结果的视觉复核阈值 (0,1]，默认 0.35	Visual review threshold for PDF matches (0,1], default 0.35	PDF 匹配結果的視覺複核閾值 (0,1]，預設 0.35	PDF ページの一致を確認する視覚スコアのしきい値 (0,1]、既定値 0.35

@@ -316,6 +316,36 @@ pub(crate) fn decode_text_with_bom(bytes: &[u8]) -> Result<String> {
     String::from_utf8(bytes.to_vec()).context(crate::tr!("文件的字符编码无法读取，请重新导出为 UTF-8 / The file's character encoding is unreadable; re-export as UTF-8"))
 }
 
+/// Calibrate original subtitle events, never a saved transcript or ASR result.
+/// Positive seconds delay subtitles; negative seconds advance them. Cues ending
+/// at/before zero disappear and cues crossing zero are clipped to the visible part.
+/// The caller decides how to report an empty result. No source file is modified.
+pub fn shift_events(events: &[TranscriptEvent], offset: f64) -> Result<Vec<TranscriptEvent>> {
+    ensure!(
+        offset.is_finite(),
+        crate::tr!("字幕时间无效 / Invalid subtitle timestamps")
+    );
+    // Preserve the original zero-offset behavior, including exact timestamp bits.
+    if offset == 0.0 {
+        return Ok(events.to_vec());
+    }
+    let mut shifted = Vec::with_capacity(events.len());
+    for event in events {
+        let mut event = event.clone();
+        event.start += offset;
+        event.end += offset;
+        ensure!(
+            event.start.is_finite() && event.end.is_finite(),
+            crate::tr!("字幕时间无效 / Invalid subtitle timestamps")
+        );
+        event.start = event.start.max(0.0);
+        if event.end > event.start {
+            shifted.push(event);
+        }
+    }
+    Ok(shifted)
+}
+
 pub fn to_srt(events: &[TranscriptEvent]) -> String {
     fn timestamp(seconds: f64) -> String {
         let millis = (seconds.max(0.) * 1000.).round() as u64;
@@ -632,6 +662,48 @@ pub fn sidecar_subtitle(video: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subtitle_offset_delays_advances_and_clips_without_changing_source() {
+        let mut events = parse_subtitle(
+            "1\n00:00:00,000 --> 00:00:01,000\ngone\n\n\
+             2\n00:00:00,500 --> 00:00:02,000\nclipped\n\n\
+             3\n00:00:03,000 --> 00:00:04,000\nkept\n",
+        );
+        events[1].raw = Some("original".into());
+        events[1].translation = Some("translated".into());
+        let original = events.clone();
+        let delayed = shift_events(&events, 1.25).unwrap();
+        assert_eq!(delayed[0].start, 1.25);
+        assert_eq!(delayed[0].end, 2.25);
+        let advanced = shift_events(&events, -1.0).unwrap();
+        assert_eq!(advanced.len(), 2);
+        assert_eq!((advanced[0].start, advanced[0].end), (0.0, 1.0));
+        assert_eq!((advanced[1].start, advanced[1].end), (2.0, 3.0));
+        assert_eq!(advanced[0].text, "clipped");
+        assert_eq!(advanced[0].raw, original[1].raw);
+        assert_eq!(advanced[0].translation, original[1].translation);
+        assert!(shift_events(&events, -4.0).unwrap().is_empty());
+        assert_eq!(events, original);
+        for zero in [0.0, -0.0] {
+            assert_eq!(shift_events(&events, zero).unwrap(), original);
+        }
+    }
+
+    #[test]
+    fn subtitle_offset_rejects_nonfinite_values_and_timestamp_overflow() {
+        for offset in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(shift_events(&[], offset).is_err());
+        }
+        let events = vec![TranscriptEvent {
+            start: f64::MAX / 2.0,
+            end: f64::MAX,
+            text: "large finite timestamp".into(),
+            raw: None,
+            translation: None,
+        }];
+        assert!(shift_events(&events, f64::MAX).is_err());
+    }
 
     fn track(language: &str, kind: SubtitleKind) -> SubtitleTrack {
         SubtitleTrack {

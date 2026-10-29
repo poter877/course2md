@@ -139,7 +139,8 @@ pub struct Draft {
 }
 
 impl Draft {
-    pub fn new(online: bool, library_id: String, defaults: ConversionOptions) -> Self {
+    pub fn new(online: bool, library_id: String, mut defaults: ConversionOptions) -> Self {
+        defaults.subtitle_offset = 0.0;
         Self {
             id: new_id("input"),
             revision: 0,
@@ -174,6 +175,7 @@ impl Draft {
         self.input = input;
         self.source = None;
         self.subtitle = None;
+        self.options.subtitle_offset = 0.0;
         self.submitted_task = None;
         self.updated = now();
         if !self.custom_title {
@@ -278,7 +280,7 @@ pub struct TaskPlan {
     pub library_id: String,
     pub folder: Option<u64>,
     pub subtitle: Option<PathBuf>,
-    /// 幻灯片 PDF：给出时成图用 PDF 页，视频只负责翻页时间。
+    /// 幻灯片 PDF：可靠匹配的截图替换为 PDF 页。
     #[serde(default)]
     pub slides: Vec<PathBuf>,
     #[serde(serialize_with = "serialize_public_config")]
@@ -722,6 +724,9 @@ impl State {
             task.plan.library_id.clone(),
             task.plan.options(),
         );
+        // A fresh video clears timing defaults, but adjusting this task restores
+        // the same video's captured timing along with its other options.
+        draft.options.subtitle_offset = task.plan.options().subtitle_offset;
         draft.input = task.plan.source.input.clone();
         let mut source = task.plan.source;
         match subtitle_events.filter(|events| !events.is_empty()) {
@@ -2703,6 +2708,26 @@ pub(crate) fn accept_source(
 mod tests {
     use super::*;
     use course2md::execution::Component;
+
+    #[test]
+    fn subtitle_timing_stays_with_its_video_across_restore_and_default_changes() {
+        let defaults = ConversionOptions {
+            subtitle_offset: 4.0,
+            ..Default::default()
+        };
+        let mut draft = Draft::new(false, "library".into(), defaults.clone());
+        assert_eq!(draft.options.subtitle_offset, 0.0);
+        draft.change_source("lecture-a.mp4".into());
+        draft.options.subtitle_offset = -1.5;
+        let saved = serde_json::to_vec(&draft).unwrap();
+        let mut restored: Draft = serde_json::from_slice(&saved).unwrap();
+        restored.inherit(&defaults);
+        assert_eq!(restored.options.subtitle_offset, -1.5);
+        restored.change_source("lecture-a.mp4".into());
+        assert_eq!(restored.options.subtitle_offset, -1.5);
+        restored.change_source("lecture-b.mp4".into());
+        assert_eq!(restored.options.subtitle_offset, 0.0);
+    }
     fn source(input: &str, title: &str) -> crate::source::Source {
         serde_json::from_value(serde_json::json!({"input":input,"title":title,"author":"","duration":60.0,"cover":null,"cover_error":null})).unwrap()
     }
@@ -3326,6 +3351,7 @@ mod tests {
         original.asr_service = Some("asr-version-a".into());
         original.ai_service = Some("ai-version-a".into());
         original.config.defaults.asr_model = Some("qwen3-0.6b".into());
+        original.config.defaults.subtitle_offset = Some(-1.5);
         let id = ws.state.enqueue(original.clone(), None).unwrap().0;
         ws.state.task_mut(&id).unwrap().state = TaskState::Running;
         ws.state.reset_input(true, Default::default(), None);
@@ -3346,6 +3372,7 @@ mod tests {
         ws.transaction(|state| state.adjust_task(&id, None))
             .unwrap();
         let revised = ws.state.draft_mut().unwrap();
+        assert_eq!(revised.options.subtitle_offset, -1.5);
         let options = revised.options.clone();
         revised.inherit(&ConversionOptions::default());
         assert_eq!(revised.options, options);
@@ -3363,6 +3390,14 @@ mod tests {
         drop(ws);
         let mut reopened = test_workspace(dir.path());
         assert_eq!(reopened.state.draft().unwrap(), &revision);
+        let mut restored_config = ConfigFile::default();
+        reopened
+            .state
+            .draft()
+            .unwrap()
+            .options
+            .apply_to(&mut restored_config);
+        assert_eq!(restored_config.defaults.subtitle_offset, Some(-1.5));
         assert_eq!(reopened.state.drafts.len(), 1);
         assert!(reopened.state.drafts.iter().all(|input| input.id != b.id));
         assert!(reopened.state.task(&id).unwrap().plan == original);

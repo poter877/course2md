@@ -172,6 +172,228 @@ fn cli_attached_utf16_subtitles_skip_asr_and_same_path_edits_make_a_new_note() {
 }
 
 #[test]
+fn subtitle_offset_cli_clips_cues_and_zero_preserves_task_identity() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("lecture.mp4");
+    common::fixture_video(&video, 4);
+    let subtitle = video.with_extension("srt");
+    let original = "1\n00:00:00,000 --> 00:00:01,000\ngone\n\n\
+                    2\n00:00:00,500 --> 00:00:02,000\nclipped\n\n\
+                    3\n00:00:02,000 --> 00:00:03,000\nkept\n";
+    std::fs::write(&subtitle, original).unwrap();
+    let convert = |offset: Option<&str>, explicit: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_course2md"));
+        cmd.arg(&video)
+            .args([
+                "--json",
+                "--no-llm",
+                "--no-summarize",
+                "--provider",
+                "api",
+                "--slide-mode",
+                "first",
+                "--formats",
+                "json",
+            ])
+            .arg("-o")
+            .arg(root.path().join("notes"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env_remove("COURSE2MD_ASR_API_KEY")
+            .stdin(Stdio::null());
+        if let Some(offset) = offset {
+            cmd.args(["--subtitle-offset", offset]);
+        }
+        if explicit {
+            cmd.arg("--subtitle-file").arg(&subtitle);
+        }
+        let output = cmd.output().unwrap();
+        let observed = events(&output);
+        assert!(output.status.success(), "{observed:#?}");
+        assert!(!observed.iter().any(|event| matches!(
+            event["stage"].as_str(),
+            Some("audio" | "transcribe" | "model/prepare")
+        )));
+        let done = observed
+            .iter()
+            .find(|event| event["type"] == "done")
+            .unwrap();
+        let version = Path::new(done["out_dir"].as_str().unwrap());
+        let document: artifact::Document =
+            serde_json::from_slice(&std::fs::read(version.join("document.json")).unwrap()).unwrap();
+        let task_id = done["task_id"].as_str().unwrap();
+        let cache_path = version
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".work")
+            .join(task_id)
+            .join("transcript.json");
+        let cache: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(cache_path).unwrap()).unwrap();
+        let transcript: Vec<TranscriptEvent> =
+            serde_json::from_value(cache["events"].clone()).unwrap();
+        // The note coalesces adjacent cues; verify its visible time range as well
+        // as the exact calibrated cue boundaries in the transcript checkpoint.
+        let speech = course2md::pipeline::all_speech(&document.sections);
+        assert_eq!(
+            speech.first().unwrap().start,
+            transcript.first().unwrap().start
+        );
+        assert_eq!(speech.last().unwrap().end, transcript.last().unwrap().end);
+        (task_id.to_owned(), transcript)
+    };
+    let (default_id, unshifted) = convert(None, false);
+    let (zero_id, zero) = convert(Some("0"), false);
+    assert_eq!(default_id, zero_id);
+    assert_eq!(unshifted, zero);
+    let (advanced_id, advanced) = convert(Some("-1"), false);
+    assert_ne!(advanced_id, zero_id);
+    assert_eq!(
+        advanced
+            .iter()
+            .map(|event| (event.start, event.end, event.text.as_str()))
+            .collect::<Vec<_>>(),
+        [(0.0, 1.0, "clipped"), (1.0, 2.0, "kept")]
+    );
+    let (_, delayed) = convert(Some("0.5"), true);
+    assert_eq!(delayed.len(), 3);
+    assert_eq!((delayed[0].start, delayed[0].end), (0.5, 1.5));
+    assert_eq!(std::fs::read_to_string(&subtitle).unwrap(), original);
+}
+
+#[test]
+fn subtitle_offset_task_inputs_and_cached_transcripts_are_shifted_once() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("lecture.mp4");
+    common::fixture_video(&video, 4);
+    for case in ["events", "file", "cached-subtitle", "cached-asr"] {
+        let task_root = root.path().join(case);
+        std::fs::create_dir_all(&task_root).unwrap();
+        let mut request = request(&task_root, &video);
+        request.duration = 4.0;
+        // Freeze this resolved path across the parent and the isolated child's
+        // XDG_CACHE_HOME, including when preparing an interrupted task identity.
+        request.config.defaults.model_dir = Some(task_root.join("models"));
+        request.config.defaults.subtitle_offset = Some(1.25);
+        let original_events = request.subtitle_events.clone().unwrap();
+        let subtitle_file = task_root.join("selected.srt");
+        let original_file = course2md::subtitle::to_srt(&original_events);
+        if case == "file" {
+            std::fs::write(&subtitle_file, &original_file).unwrap();
+            request.subtitle = Some(subtitle_file.clone());
+            request.subtitle_events = None;
+        }
+        let expected = if case == "cached-asr" {
+            request.subtitle_events = None;
+            request.config.defaults.transcript_source = Some(TranscriptSource::Asr);
+            original_events.clone()
+        } else {
+            course2md::subtitle::shift_events(&original_events, 1.25).unwrap()
+        };
+        if case.starts_with("cached-") {
+            let binding = request.binding(&request.resolve().unwrap()).unwrap();
+            course2md::execution::bind_work_dir(&request.work_dir, &binding).unwrap();
+            // Simulate interruption after transcription, before publication.
+            let cache = serde_json::json!({"source": if case == "cached-asr" { "asr" } else { "selected-subtitle" }, "events": expected});
+            std::fs::write(
+                request.work_dir.join("transcript.json"),
+                serde_json::to_vec(&cache).unwrap(),
+            )
+            .unwrap();
+        }
+        let output = run(&task_root, &request);
+        let observed = events(&output);
+        assert!(output.status.success(), "{case}: {observed:#?}");
+        assert!(!observed.iter().any(|event| matches!(
+            event["stage"].as_str(),
+            Some("audio" | "transcribe" | "model/prepare")
+        )));
+        let transcript = request.work_dir.join("transcript.json");
+        let cache_bytes = std::fs::read(&transcript).unwrap();
+        let cache: serde_json::Value = serde_json::from_slice(&cache_bytes).unwrap();
+        let actual: Vec<TranscriptEvent> = serde_json::from_value(cache["events"].clone()).unwrap();
+        assert_eq!(actual, expected, "{case}");
+        let version = request.course_dir.join("versions/version-one");
+        let document: artifact::Document =
+            serde_json::from_slice(&std::fs::read(version.join("document.json")).unwrap()).unwrap();
+        assert_eq!(
+            course2md::pipeline::all_speech(&document.sections),
+            expected,
+            "{case}"
+        );
+        let resumed = run(&task_root, &request);
+        assert!(resumed.status.success(), "{case}: {:?}", events(&resumed));
+        assert_eq!(std::fs::read(&transcript).unwrap(), cache_bytes);
+        if case == "file" {
+            assert_eq!(
+                std::fs::read_to_string(subtitle_file).unwrap(),
+                original_file
+            );
+        }
+        // Changing calibration cannot reuse an existing task's shifted transcript.
+        request.config.defaults.subtitle_offset = Some(2.0);
+        let changed = run(&task_root, &request);
+        assert!(!changed.status.success());
+        assert_eq!(std::fs::read(&transcript).unwrap(), cache_bytes);
+    }
+}
+
+#[test]
+fn subtitle_offset_rejects_all_clipped_text_without_falling_back_to_asr() {
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("lecture.mp4");
+    std::fs::write(&video, b"never needs media processing").unwrap();
+    let mut request = request(root.path(), &video);
+    request.config.defaults.subtitle_offset = Some(-1.0);
+    request.config.defaults.transcript_source = Some(TranscriptSource::Auto);
+    let output = run(root.path(), &request);
+    let observed = events(&output);
+    assert!(!output.status.success(), "{observed:#?}");
+    assert!(
+        observed.iter().any(|event| event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("没有可读文字")),
+        "{observed:#?}"
+    );
+    assert!(!observed.iter().any(|event| matches!(
+        event["stage"].as_str(),
+        Some("audio" | "transcribe" | "model/prepare" | "download")
+    )));
+    assert!(!request.work_dir.join("transcript.json").exists());
+}
+
+#[test]
+fn subtitle_offset_zero_keeps_legacy_task_binding() {
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("lecture.mp4");
+    std::fs::write(&video, b"identity only").unwrap();
+    let mut request = request(root.path(), &video);
+    let legacy = request.binding(&request.resolve().unwrap()).unwrap();
+    assert!(legacy["config"].get("subtitle_offset").is_none());
+    for offset in [0.0, -0.0] {
+        request.config.defaults.subtitle_offset = Some(offset);
+        assert_eq!(
+            request.binding(&request.resolve().unwrap()).unwrap(),
+            legacy
+        );
+    }
+    request.config.defaults.subtitle_offset = Some(-0.5);
+    let shifted = request.binding(&request.resolve().unwrap()).unwrap();
+    assert_eq!(shifted["config"]["subtitle_offset"], -0.5);
+    assert_ne!(shifted, legacy);
+}
+
+#[test]
 fn missing_pdf_tool_fails_before_screenshot_or_transcription_work() {
     if !common::ffmpeg_available() {
         return;

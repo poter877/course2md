@@ -8,12 +8,54 @@ impl ConversionOptions {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::ConversionOptions;
+    use course2md::{config::TranscriptSource, settings::ConfigFile};
+
+    #[test]
+    fn timing_is_frozen_in_subtitle_plans_and_does_not_shift_speech_recognition() {
+        let mut options = ConversionOptions {
+            subtitle_offset: -1.5,
+            ..Default::default()
+        };
+        let mut config = ConfigFile::default();
+        options.apply_to(&mut config);
+        assert_eq!(config.defaults.subtitle_offset, Some(-1.5));
+        assert_eq!(
+            ConversionOptions::from_config(&config).subtitle_offset,
+            -1.5
+        );
+        options.source_mode = TranscriptSource::Asr;
+        options.apply_to(&mut config);
+        assert_eq!(config.defaults.subtitle_offset, None);
+        assert_eq!(options.subtitle_offset, -1.5);
+        options.source_mode = TranscriptSource::Subtitle;
+        assert_eq!(options.as_planned().subtitle_offset, -1.5);
+    }
+
+    #[test]
+    fn clearing_subtitle_timing_removes_the_previous_task_config_value() {
+        let mut config = ConfigFile::default();
+        config.defaults.subtitle_offset = Some(-1.5);
+        let mut options = ConversionOptions::from_config(&config);
+        assert_eq!(options.as_planned().subtitle_offset, -1.5);
+        options.subtitle_offset = 0.0;
+        options.apply_to(&mut config);
+        assert_eq!(config.defaults.subtitle_offset, None);
+        assert_eq!(ConversionOptions::from_config(&config).subtitle_offset, 0.0);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ConversionOptions {
     #[serde(with = "crate::provider_serde")]
     pub(crate) provider: Option<course2md::config::AsrProvider>,
     #[serde(with = "crate::workspace::text_source_index")]
     pub(crate) source_mode: course2md::config::TranscriptSource,
+    /// Seconds added to subtitle timestamps for this video only.
+    #[serde(default)]
+    pub(crate) subtitle_offset: f64,
     pub(crate) llm: bool,
     #[serde(default)]
     pub(crate) summarize: bool,
@@ -48,6 +90,7 @@ impl ConversionOptions {
         Self {
             provider,
             source_mode,
+            subtitle_offset: config.defaults.subtitle_offset.unwrap_or(0.0),
             llm,
             summarize: config.llm.summarize,
             vision: config.llm.vision,
@@ -78,6 +121,10 @@ impl ConversionOptions {
         use course2md::config::OutputFormat;
         config.defaults.provider = self.provider;
         config.defaults.transcript_source = Some(self.source_mode);
+        config.defaults.subtitle_offset = (self.source_mode
+            != course2md::config::TranscriptSource::Asr)
+            .then_some(self.subtitle_offset)
+            .filter(|offset| *offset != 0.0);
         config.defaults.keep_video = Some(self.keep_video);
         config.defaults.resume = Some(true);
         config.defaults.formats = Some(

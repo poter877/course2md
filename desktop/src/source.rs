@@ -39,7 +39,7 @@ pub struct Source {
     pub subtitle_request: Option<course2md::subtitle::SubtitleTrack>,
     #[serde(default)]
     pub subtitle_read_error: Option<course2md::subtitle::SubtitleReadError>,
-    /// 本视频附带的幻灯片 PDF：视频只用于换页，成图改用这些页。
+    /// 本视频附带的幻灯片 PDF：可靠匹配的截图替换为这些页面。
     #[serde(default)]
     pub slides: Vec<PathBuf>,
 }

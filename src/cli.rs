@@ -106,7 +106,7 @@ pub struct RunOpts {
     #[arg(help_heading = "截图 / Slides")]
     pub roi: Option<String>,
 
-    /// 外部幻灯片 PDF：视频只用来检测翻页，成图与页码改用 PDF 页（可重复，按顺序编号 deck）
+    /// 外部幻灯片 PDF：可靠匹配使用 PDF 页，其余保留视频截图（可重复，按顺序编号 deck）
     #[arg(long, value_name = "PDF")]
     #[arg(help_heading = "幻灯片 / Slides")]
     pub slides: Vec<PathBuf>,
@@ -116,7 +116,12 @@ pub struct RunOpts {
     #[arg(help_heading = "输入与输出 / Input and output")]
     pub subtitle_file: Option<PathBuf>,
 
-    /// 帧与 PDF 页的视觉匹配最低分 (0,1]，默认 0.35
+    /// 字幕偏移（秒）：正数延后，负数提前；不影响语音识别 / Subtitle offset in seconds: positive delays, negative advances; does not affect ASR
+    #[arg(long, value_name = "SECONDS", allow_hyphen_values = true)]
+    #[arg(help_heading = "输入与输出 / Input and output")]
+    pub subtitle_offset: Option<f64>,
+
+    /// PDF 匹配结果的视觉复核阈值 (0,1]，默认 0.35
     #[arg(long, value_name = "SCORE")]
     #[arg(help_heading = "幻灯片 / Slides")]
     pub slide_match_threshold: Option<f64>,
@@ -661,6 +666,18 @@ fn parse_translation_target(value: &str) -> Result<String, String> {
 mod i18n_tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn subtitle_offset_accepts_signed_seconds() {
+        for seconds in ["-2.5", "0", "1.25"] {
+            let cli = Cli::try_parse_from(["course2md", "video.mp4", "--subtitle-offset", seconds])
+                .unwrap();
+            assert_eq!(
+                cli.opts.subtitle_offset,
+                Some(seconds.parse::<f64>().unwrap())
+            );
+        }
+    }
 
     #[test]
     fn rendered_headings_follow_the_language() {

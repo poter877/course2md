@@ -460,7 +460,11 @@ pub struct PipelineConfig {
     /// 外部字幕文件（SRT/VTT）；给出时不再查找平台字幕或同名旁挂字幕
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subtitle_file: Option<PathBuf>,
-    /// 外部幻灯片 PDF：视频只用来检测翻页时间，成图与页码改用 PDF 页
+    /// Shift original subtitle timestamps once; positive delays, negative advances.
+    /// Omit zero so saved task identities from before this option remain compatible.
+    #[serde(default, skip_serializing_if = "is_zero_subtitle_offset")]
+    pub subtitle_offset: f64,
+    /// 外部幻灯片 PDF：可靠匹配使用 PDF 页，其余保留视频截图
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub slides: Vec<PathBuf>,
     /// 帧与 PDF 页的视觉匹配最低分（低于仍保留，但在 alignment.json 标 uncertain）
@@ -547,6 +551,10 @@ fn parse_coord(s: &str) -> anyhow::Result<f64> {
     Ok(v)
 }
 
+fn is_zero_subtitle_offset(value: &f64) -> bool {
+    *value == 0.0
+}
+
 impl PipelineConfig {
     /// 身份文件用的脱敏配置：清空 llm.api_key 与 asr_api.api_key 后的 JSON。
     ///
@@ -585,6 +593,7 @@ impl PipelineConfig {
         finite("cooldown", self.cooldown)?;
         finite("stable_secs", self.stable_secs)?;
         finite("max_speech", self.max_speech as f64)?;
+        finite("subtitle_offset", self.subtitle_offset)?;
 
         anyhow::ensure!(
             self.similarity > 0.0 && self.similarity <= 1.0,
@@ -1159,6 +1168,7 @@ mod tests {
             mmproj_offload: true,
             transcript_source: TranscriptSource::Auto,
             subtitle_file: None,
+            subtitle_offset: 0.0,
             slides: Vec::new(),
             slide_match_threshold: DEFAULT_SLIDE_MATCH_THRESHOLD,
         }

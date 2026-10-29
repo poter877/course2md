@@ -23,6 +23,8 @@ pub struct Defaults {
     pub asr_model: Option<String>,
     /// 转写来源：auto（字幕优先）| subtitle | asr
     pub transcript_source: Option<crate::config::TranscriptSource>,
+    /// Subtitle timing in seconds: positive delays, negative advances; never shifts ASR.
+    pub subtitle_offset: Option<f64>,
     pub max_speech: Option<f32>,
     pub formats: Option<Vec<crate::config::OutputFormat>>,
     pub model_dir: Option<PathBuf>,
@@ -199,6 +201,7 @@ pub fn template() -> String {
             c::default_model(c::default_provider_hint()).to_string(),
         ),
         ("{MAX_SPEECH}", format!("{:?}", c::DEFAULT_MAX_SPEECH)),
+        ("{SUBTITLE_OFFSET}", "0.0".to_string()),
         ("{FORMATS}", formats),
         ("{API_BASE_URL}", api.base_url),
         ("{API_MODEL}", api.model),
@@ -272,6 +275,8 @@ const TEMPLATE: &str = r#"# course2md 配置 / Configuration
 # auto 优先字幕，无字幕再识别 / auto: subtitles first, then speech recognition
 # subtitle 仅字幕；asr 仅识别 / subtitle: subtitles only; asr: speech recognition only
 #transcript_source = "{TRANSCRIPT_SOURCE}"
+# 字幕偏移（秒）：正数延后，负数提前；不影响语音识别 / Subtitle offset in seconds: positive delays, negative advances; does not affect ASR
+#subtitle_offset = {SUBTITLE_OFFSET}
 # 每段语音最长秒数 (1–600) / Maximum speech segment length in seconds (1–600)
 #max_speech = {MAX_SPEECH}
 # 输出格式 / Output formats: md, html, json
@@ -345,6 +350,7 @@ pub fn print_effective(cfg: &ConfigFile) -> Result<()> {
             r.asr_model.clone().unwrap_or_else(|| "-".into()),
         ),
         ("transcript_source", r.transcript_source.to_string()),
+        ("subtitle_offset", r.subtitle_offset.to_string()),
         ("max_speech", r.max_speech.to_string()),
         (
             "formats",
@@ -429,6 +435,7 @@ mod tests {
         assert_eq!(from_template.similarity, built_in.similarity);
         assert_eq!(from_template.cooldown, built_in.cooldown);
         assert_eq!(from_template.max_speech, built_in.max_speech);
+        assert_eq!(from_template.subtitle_offset, built_in.subtitle_offset);
         assert_eq!(from_template.gpu_layers, built_in.gpu_layers);
         assert_eq!(from_template.formats, built_in.formats);
         assert_eq!(file.asr_api, super::AsrApi::default());

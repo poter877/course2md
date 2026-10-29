@@ -815,8 +815,14 @@ async fn run_prepared(
     // has completed, retries need neither an expiring subtitle URL nor ASR tools.
     let selected = if cached.is_some() {
         None
+    } else if let Some((events, source)) = subtitles(cfg, job, is_local, input).await? {
+        // Only original subtitle input is shifted. The transcript cache already
+        // contains calibrated times, while ASR and reprocessing never enter here.
+        let events = crate::subtitle::shift_events(&events, cfg.subtitle_offset)?;
+        execution::validate_events(&events)?;
+        Some((events, source))
     } else {
-        subtitles(cfg, job, is_local, input).await?
+        None
     };
     progress::done(Stage::Subtitle);
     check_tools(
@@ -1789,6 +1795,7 @@ mod tests {
             mmproj_offload: true,
             transcript_source: c::TranscriptSource::Asr,
             subtitle_file: None,
+            subtitle_offset: 0.0,
             slides: Vec::new(),
             slide_match_threshold: c::DEFAULT_SLIDE_MATCH_THRESHOLD,
         };

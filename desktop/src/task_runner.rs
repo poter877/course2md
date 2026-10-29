@@ -167,11 +167,16 @@ fn update_input_form(
     input: String,
     title: String,
     source: Option<source::Source>,
-    options: ConversionOptions,
+    mut options: ConversionOptions,
     folder: Option<u64>,
     scroll: f32,
 ) -> bool {
     let previous = draft.clone();
+    // These options were captured before change_source resets per-video state.
+    // Do not write the previous video's timing back over that reset.
+    if input != draft.input {
+        options.subtitle_offset = 0.0;
+    }
     update_draft_source_title(draft, input, title, source);
     apply_draft_options(draft, options);
     draft.folder = folder;
@@ -2232,6 +2237,49 @@ pub(crate) mod tests {
         assert_eq!(courses[1].dir, other_library.dir);
         assert!(courses[1].incomplete());
         assert!(old.manifest.as_ref().unwrap().partial);
+    }
+
+    #[test]
+    fn subtitle_timing_survives_same_video_saves_but_not_a_replacement_video() {
+        let mut draft = crate::workspace::Draft::new(false, "library".into(), Default::default());
+        draft.change_source("video-a.mp4".into());
+        draft.options.subtitle_offset = -1.5;
+        draft.options.summarize = true;
+        for input in ["video-a.mp4", "video-a.mp4", "video-b.mp4", "video-b.mp4"] {
+            let options = draft.options.clone();
+            let changed = draft.input != input;
+            let revision = draft.revision;
+            update_input_form(
+                &mut draft,
+                input.into(),
+                String::new(),
+                None,
+                options,
+                None,
+                0.0,
+            );
+            assert_eq!(
+                draft.options.subtitle_offset,
+                if input == "video-a.mp4" { -1.5 } else { 0.0 }
+            );
+            assert_eq!(draft.revision, revision + u64::from(changed));
+            assert!(draft.options.summarize);
+            // Persist and restore the actual result of the form-save path.
+            draft = serde_json::from_slice(&serde_json::to_vec(&draft).unwrap()).unwrap();
+        }
+        // This video's new correction also survives later saves.
+        draft.options.subtitle_offset = 2.0;
+        let options = draft.options.clone();
+        update_input_form(
+            &mut draft,
+            "video-b.mp4".into(),
+            String::new(),
+            None,
+            options,
+            None,
+            0.0,
+        );
+        assert_eq!(draft.options.subtitle_offset, 2.0);
     }
 
     #[test]

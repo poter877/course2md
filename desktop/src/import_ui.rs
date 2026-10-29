@@ -253,6 +253,18 @@ fn subtitle_needs_confirmation(source: &source::Source, source_mode: TranscriptS
             || source.subtitle_read_error.is_some())
 }
 
+fn subtitle_timing_available(
+    source: &source::Source,
+    source_mode: TranscriptSource,
+    loading: bool,
+) -> bool {
+    !loading
+        && !uses_speech(source, source_mode)
+        && source.selected_subtitle.is_some()
+        && source.subtitle_request.is_none()
+        && source.subtitle_read_error.is_none()
+}
+
 /// Follow only this input's submitted recovery chain. A matching URL or the
 /// selected queue item alone cannot establish that a task belongs to this form.
 fn submitted_input_task<'a>(
@@ -867,7 +879,7 @@ impl Desktop {
             ))
             .child(help(
                 "import-slides-hint",
-                course2md::tr!("给出 PDF 时，视频只用来判断翻页；成图与页码改用 PDF 页。"),
+                course2md::tr!("可靠匹配的页面使用 PDF；其余保留视频截图。"),
             ))
             .child(files)
             .child(
@@ -2556,6 +2568,38 @@ impl Desktop {
                 options,
             ));
         }
+        if failure.is_none()
+            && subtitle_timing_available(
+                source,
+                self.task_options().source_mode,
+                self.subtitle_loading,
+            )
+        {
+            let offset = self.task_options().subtitle_offset;
+            view = view.child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .items_center()
+                    .child(
+                        outline_pill("adjust-subtitle-timing", cx)
+                            .icon(icons::subtitles())
+                            .label(course2md::tr!("调整字幕时间"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_subtitle_timing(window, cx)
+                            })),
+                    )
+                    .when(offset != 0.0, |row| {
+                        row.child(
+                            accessible_text(
+                                "subtitle-timing-value",
+                                course2md::tr!("字幕偏移：{} 秒", format!("{offset:+}")),
+                            )
+                            .text_color(color(GRAY)),
+                        )
+                    }),
+            );
+        }
         view
     }
 
@@ -3746,6 +3790,15 @@ impl Desktop {
         let compact = is_compact(window);
         let has_linked_task = linked_state.is_some();
         let text_required = !has_linked_task && self.subtitle_attention_required();
+        // Confirmed subtitles still need their timing control and current offset.
+        let show_text_source = text_required
+            || self.source_preview.as_ref().is_some_and(|source| {
+                subtitle_timing_available(
+                    source,
+                    self.task_options().source_mode,
+                    self.subtitle_loading,
+                )
+            });
         // Text-source decisions and submission obstacles belong to the
         // previewed video, so they sit inside its card.
         let previewing = self.source_preview.is_some();
@@ -3756,7 +3809,7 @@ impl Desktop {
                     .w_full()
                     .min_w_0()
                     .gap_4()
-                    .when(text_required, |extra| {
+                    .when(show_text_source, |extra| {
                         extra.child(
                             v_flex()
                                 .w_full()
@@ -4248,7 +4301,7 @@ mod tests {
     use super::{
         ConversionFollow, ConversionGate, GateInputs, automatic_subtitle_fallback,
         completed_input_task, conversion_gate, locked_input_task, submitted_input_task,
-        subtitle_needs_confirmation, uses_speech,
+        subtitle_needs_confirmation, subtitle_timing_available, uses_speech,
     };
     use crate::{source, workspace};
     use course2md::config::TranscriptSource;
@@ -5076,14 +5129,34 @@ mod tests {
             &source,
             TranscriptSource::Auto
         ));
+        // A healthy source has no attention banner, but timing remains editable.
+        for mode in [TranscriptSource::Auto, TranscriptSource::Subtitle] {
+            assert!(subtitle_timing_available(&source, mode, false));
+            assert!(!subtitle_timing_available(&source, mode, true));
+        }
+        assert!(!subtitle_timing_available(
+            &source,
+            TranscriptSource::Asr,
+            false
+        ));
 
         source.subtitle_request = Some(track);
         assert!(subtitle_needs_confirmation(&source, TranscriptSource::Auto));
+        assert!(!subtitle_timing_available(
+            &source,
+            TranscriptSource::Auto,
+            false
+        ));
         source.subtitle_request = None;
         source.subtitle_read_error = Some(SubtitleReadError::Failed {
             message: "无法读取新字幕，原正文仍保留".into(),
         });
         assert!(subtitle_needs_confirmation(&source, TranscriptSource::Auto));
+        assert!(!subtitle_timing_available(
+            &source,
+            TranscriptSource::Auto,
+            false
+        ));
 
         // Cancelling the replacement or choosing the cached text restores the
         // confirmed source without opening unrelated generation preferences.
@@ -5092,7 +5165,17 @@ mod tests {
             &source,
             TranscriptSource::Subtitle
         ));
+        assert!(subtitle_timing_available(
+            &source,
+            TranscriptSource::Subtitle,
+            false
+        ));
         source.selected_subtitle = None;
+        assert!(!subtitle_timing_available(
+            &source,
+            TranscriptSource::Subtitle,
+            false
+        ));
         assert!(subtitle_needs_confirmation(
             &source,
             TranscriptSource::Subtitle

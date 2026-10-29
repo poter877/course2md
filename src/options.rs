@@ -123,6 +123,7 @@ pub fn resolve(
             .or(d.transcript_source)
             .unwrap_or_default(),
         subtitle_file: opts.subtitle_file.clone(),
+        subtitle_offset: opts.subtitle_offset.or(d.subtitle_offset).unwrap_or(0.0),
         slides: opts.slides.clone(),
         slide_match_threshold: opts
             .slide_match_threshold
@@ -179,6 +180,42 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn subtitle_offset_cli_overrides_config_and_zero_restores_default_identity() {
+        let mut file = settings::ConfigFile::default();
+        let default = resolve("video".into(), &Default::default(), &file).unwrap();
+        let original_identity = default.redacted_for_identity(&default.out_root);
+        assert_eq!(default.subtitle_offset, 0.0);
+        assert!(original_identity.get("subtitle_offset").is_none());
+        let legacy: config::PipelineConfig =
+            serde_json::from_value(original_identity.clone()).unwrap();
+        assert_eq!(legacy.subtitle_offset, 0.0);
+        file.defaults.subtitle_offset = Some(1.25);
+        let from_file = resolve("video".into(), &Default::default(), &file).unwrap();
+        assert_eq!(from_file.subtitle_offset, 1.25);
+        assert_ne!(
+            from_file.redacted_for_identity(&from_file.out_root),
+            original_identity
+        );
+        for offset in [-2.5, 0.0, -0.0] {
+            let opts = RunOpts {
+                subtitle_offset: Some(offset),
+                ..Default::default()
+            };
+            let cfg = resolve("video".into(), &opts, &file).unwrap();
+            assert_eq!(cfg.subtitle_offset, offset);
+            cfg.validate().unwrap();
+            if offset == 0.0 {
+                assert_eq!(cfg.redacted_for_identity(&cfg.out_root), original_identity);
+            }
+        }
+        for offset in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            file.defaults.subtitle_offset = Some(offset);
+            let cfg = resolve("video".into(), &Default::default(), &file).unwrap();
+            assert!(cfg.validate().is_err());
+        }
+    }
 
     #[test]
     fn a_qwen3_default_is_not_run_on_the_npu() {

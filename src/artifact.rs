@@ -627,7 +627,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let work = root.path().join("work");
         std::fs::create_dir_all(&work).unwrap();
-        let report = br#"{"schema":1,"pages":[{"t":0.0,"image":"","uncertain":true}]}"#;
+        let report = br#"{"schema":1,"pages":[{"page":0,"t":0.0,"image":"","uncertain":true}]}"#;
         std::fs::write(work.join("alignment.json"), report).unwrap();
         let target = Target {
             task_id: "task".into(),

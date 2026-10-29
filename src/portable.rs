@@ -95,6 +95,8 @@ struct AlignmentReport {
 
 #[derive(serde::Deserialize, serde::Serialize)]
 struct AlignmentPage {
+    #[serde(default)]
+    page: Option<usize>,
     t: f64,
     image: String,
     uncertain: bool,
@@ -153,6 +155,7 @@ fn page_reviews(
             let Some([index]) = matches.map(Vec::as_slice) else {
                 anyhow::bail!("alignment does not match note sections");
             };
+            page.uncertain &= page.page.is_some();
             sections[*index] |= page.uncertain;
             if !page.image.is_empty() {
                 page.image = images
@@ -730,11 +733,31 @@ mod tests {
             "slides": ["/private/teacher/deck.pdf"],
             "pages": document.sections.iter().enumerate().map(|(index, section)| {
                 serde_json::json!({
+                    "page": index,
                     "t": section.t, "image": section.image, "uncertain": index == 1,
                     "visual": 0.41, "keywords": ["private diagnostic"]
                 })
             }).collect::<Vec<_>>()
         })
+    }
+
+    #[test]
+    fn legacy_video_fallback_exports_without_review_notice() {
+        let root = tempfile::tempdir().unwrap();
+        let document = fixture(root.path());
+        let mut report = alignment_report(&document);
+        report["pages"][1]["page"] = serde_json::Value::Null;
+        let original = report.to_string();
+        std::fs::write(root.path().join("alignment.json"), &original).unwrap();
+        let destination = root.path().join("course.html");
+        write_document(root.path(), &document, OutputFormat::Html, &destination).unwrap();
+        let html = std::fs::read_to_string(destination).unwrap();
+        assert!(!html.contains("class=\"page-review\""));
+        assert_eq!(html.matches("<img ").count(), document.sections.len());
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("alignment.json")).unwrap(),
+            original
+        );
     }
 
     #[test]

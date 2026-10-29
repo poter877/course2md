@@ -1531,7 +1531,7 @@ mod tests {
         rich_fixture(dir.path());
         let report = serde_json::json!({
             "schema": 1,
-            "pages": [{"t": 0.0, "image": "", "uncertain": true}],
+            "pages": [{"page": 0, "t": 0.0, "image": "", "uncertain": true}],
             "slides": ["/private/deck.pdf"]
         });
         let report_path = dir.path().join("alignment.json");

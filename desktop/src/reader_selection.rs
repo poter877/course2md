@@ -22,6 +22,7 @@ struct SelectionEditor {
     original: String,
     mode: AiRegionMode,
     pictures: Vec<SelectionPicture>,
+    selected_paths: Vec<PathBuf>,
     picture_page: usize,
     pictures_loading: bool,
     instruction: Entity<TextareaState>,
@@ -74,40 +75,40 @@ fn same_selection_source(
 fn selection_pictures(
     preview: &notes::Preview,
     frames: &[Frame],
-    spans: &[SourceSpan],
+    selected_paths: &[PathBuf],
 ) -> Vec<SelectionPicture> {
-    let related: HashSet<&str> = spans
-        .iter()
-        .filter_map(|span| preview.document.sections.get(span.section))
-        .map(|section| section.image.as_str())
-        .collect();
     let mut pictures = Vec::new();
     let mut seen = HashSet::new();
     if let Some(manifest) = &preview.course.manifest {
         // load_reader_data keeps manifest/frame order and validates paths
         // using safe_asset_path on its worker. Never join untrusted asset
         // names here, call is_file in render, or give raw paths to img.
-        for (source, frame) in manifest.frames.iter().zip(frames.iter()) {
+        for (_source, frame) in manifest.frames.iter().zip(frames.iter()) {
             if let Some(image) = &frame.image
                 && seen.insert(image.path.clone())
             {
                 pictures.push(SelectionPicture {
                     path: image.path.clone(),
                     label: frame_label(frame),
-                    selected: related.contains(source.image.as_str()),
+                    selected: selected_paths.contains(&image.path),
                 });
             }
         }
     }
-    // Related screenshots come first, in note order; cap even the defaults.
-    pictures.sort_by_key(|picture| !picture.selected);
-    let mut defaults = 0;
-    for picture in &mut pictures {
-        if picture.selected {
-            defaults += 1;
-            picture.selected = defaults <= MAX_IMAGES;
+    // Keep an unreadable selected image visible so it cannot silently disappear
+    // from the request; the normal failed-thumbnail state allows deselection.
+    for path in selected_paths {
+        if seen.insert(path.clone()) {
+            pictures.push(SelectionPicture {
+                path: path.clone(),
+                label: course2md::tr!("截图").into(),
+                selected: true,
+            });
         }
     }
+    // Preserve exactly the drag selection. Do not silently attach a nearby image
+    // or drop selected images above the request limit; the user can deselect them.
+    pictures.sort_by_key(|picture| !picture.selected);
     pictures
 }
 
@@ -115,6 +116,7 @@ impl Desktop {
     pub(super) fn open_selection_editor(
         &mut self,
         spans: Vec<SourceSpan>,
+        selected_paths: Vec<PathBuf>,
         mode: AiRegionMode,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -138,7 +140,7 @@ impl Desktop {
         let pictures = if pictures_loading {
             Vec::new()
         } else {
-            selection_pictures(preview, &self.reader_ui.frames, &spans)
+            selection_pictures(preview, &self.reader_ui.frames, &selected_paths)
         };
         let version = preview.course.dir.clone();
         let preview = preview.clone();
@@ -163,6 +165,7 @@ impl Desktop {
             original,
             mode,
             pictures,
+            selected_paths,
             picture_page: 0,
             pictures_loading,
             instruction,
@@ -204,8 +207,11 @@ impl SelectionEditor {
     fn sync_source(&mut self, desktop: &Desktop) {
         self.stale |= !self.matches(desktop);
         if !self.stale && self.pictures_loading && !desktop.reader_ui.data_loading {
-            self.pictures =
-                selection_pictures(&self.preview, &desktop.reader_ui.frames, &self.spans);
+            self.pictures = selection_pictures(
+                &self.preview,
+                &desktop.reader_ui.frames,
+                &self.selected_paths,
+            );
             self.pictures_loading = false;
         }
     }
@@ -627,15 +633,24 @@ mod tests {
     }
 
     #[test]
-    fn defaults_are_related_unique_validated_images_and_never_more_than_four() {
+    fn defaults_are_exactly_the_dragged_images_and_keep_over_limit_visible() {
         let (_temp, mut preview) = note();
         let mut data = load_reader_data(&preview);
-        let spans: Vec<_> = (0..6).map(|section| span(section, 0, 3)).collect();
-        let pictures = selection_pictures(&preview, &data.frames, &spans);
+        let paths: Vec<_> = data
+            .frames
+            .iter()
+            .filter_map(|frame| frame.image.as_ref().map(|image| image.path.clone()))
+            .collect();
+        assert!(
+            selection_pictures(&preview, &data.frames, &[])
+                .iter()
+                .all(|p| !p.selected)
+        );
+        let pictures = selection_pictures(&preview, &data.frames, &paths);
         assert_eq!(pictures.len(), 6);
         assert_eq!(
             pictures.iter().filter(|picture| picture.selected).count(),
-            4
+            6
         );
 
         // Duplicate manifest entries share one selectable image; missing files
@@ -644,7 +659,13 @@ mod tests {
         manifest.frames.push(manifest.frames[0].clone());
         data.frames.push(data.frames[0].clone());
         data.frames[1].image = None;
-        let pictures = selection_pictures(&preview, &data.frames, &[span(5, 0, 3)]);
+        let unavailable = selection_pictures(&preview, &data.frames, &[paths[1].clone()]);
+        assert!(
+            unavailable
+                .iter()
+                .any(|picture| picture.path == paths[1] && picture.selected)
+        );
+        let pictures = selection_pictures(&preview, &data.frames, &[paths[5].clone()]);
         assert_eq!(pictures.len(), 5);
         assert!(pictures[0].selected);
         assert_eq!(
@@ -659,7 +680,7 @@ mod tests {
         preview.course.manifest.as_mut().unwrap().frames[0].image = "../outside.png".into();
         let checked = load_reader_data(&preview);
         assert!(checked.frames[0].image.is_none());
-        let pictures = selection_pictures(&preview, &checked.frames, &spans);
+        let pictures = selection_pictures(&preview, &checked.frames, &paths);
         assert!(
             pictures
                 .iter()

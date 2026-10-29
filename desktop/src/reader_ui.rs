@@ -509,6 +509,7 @@ fn selected_text<'a>(
 /// opening the menu clears the live selection or a reload retains the old Rc.
 #[derive(Clone)]
 struct ReaderSelectionSnapshot {
+    images: Vec<PathBuf>,
     spans: Vec<SourceSpan>,
     preview: Rc<notes::Preview>,
     generation: u64,
@@ -691,6 +692,7 @@ pub(crate) struct State {
     /// AI 编辑（原地写回）正在进行的标记与最近一次结果。
     ai_edit: AiEditState,
     selected: BTreeMap<(usize, usize), Range<usize>>,
+    selected_images: BTreeMap<usize, PathBuf>,
     selection_generation: u64,
     frames: Rc<Vec<Frame>>,
     frame_by_path: Rc<HashMap<PathBuf, usize>>,
@@ -910,6 +912,7 @@ impl State {
             data_loading: false,
             ai_edit: AiEditState::default(),
             selected: BTreeMap::new(),
+            selected_images: BTreeMap::new(),
             selection_generation: 0,
             frames: Rc::default(),
             frame_by_path: Rc::default(),
@@ -1833,6 +1836,7 @@ fn note_paragraph(flow: &NoteFlow, index: usize, text: &SharedString, anchor: &s
                     {
                         if this.reader_ui.selection_generation != this.read_generation {
                             this.reader_ui.selected.clear();
+                            this.reader_ui.selected_images.clear();
                             this.reader_ui.selection_generation = this.read_generation;
                         }
                         if let Some(range) = range {
@@ -1844,11 +1848,6 @@ fn note_paragraph(flow: &NoteFlow, index: usize, text: &SharedString, anchor: &s
                 });
             }),
         );
-    let pressed = Rc::new(RefCell::new(None::<ReaderSelectionSnapshot>));
-    let press_snapshot = pressed.clone();
-    let press_owner = flow.desktop.clone();
-    let press_source = flow.preview.clone();
-    let menu_owner = flow.desktop.clone();
     let weak = flow.desktop.clone();
     let clean = weak.clone();
     let translate = weak.clone();
@@ -1927,7 +1926,7 @@ fn note_paragraph(flow: &NoteFlow, index: usize, text: &SharedString, anchor: &s
         });
     // 段落 AI 入口只在悬停该段时出现，避免每段都挂一个常驻图标。
     let group_name = SharedString::from(format!("paragraph-row-{index}"));
-    h_flex()
+    let row = h_flex()
         .id(("paragraph-row", index))
         .w_full()
         .min_w_0()
@@ -1941,80 +1940,90 @@ fn note_paragraph(flow: &NoteFlow, index: usize, text: &SharedString, anchor: &s
                 .opacity(0.0)
                 .group_hover(group_name, |style| style.opacity(1.0))
                 .child(action),
-        )
-        .on_mouse_down(MouseButton::Right, move |_, _, cx| {
-            let snapshot = press_owner.upgrade().and_then(|owner| {
-                let this = owner.read(cx);
-                if this.page != Page::Result
-                    || this.reading
-                    || !this
-                        .preview
-                        .as_ref()
-                        .is_some_and(|current| Rc::ptr_eq(current, &press_source))
-                    || this.reader_ui.selection_generation != this.read_generation
-                    || !this.reader_ui.selected.contains_key(&(section, speech))
-                {
-                    return None;
-                }
-                let spans = this
-                    .reader_ui
-                    .selected
-                    .iter()
-                    .map(|(&(section, speech), range)| SourceSpan {
-                        section,
-                        speech,
-                        start: range.start,
-                        end: range.end,
-                    })
-                    .collect();
-                Some(ReaderSelectionSnapshot {
-                    spans,
-                    preview: press_source.clone(),
-                    generation: this.read_generation,
-                })
-            });
-            *press_snapshot.borrow_mut() = snapshot;
-        })
-        .context_menu(move |mut menu, _, _| {
-            let snapshot = pressed.borrow().clone();
-            for (label, mode) in [
-                (course2md::tr!("AI 清理选中文字"), AiRegionMode::Clean),
-                (course2md::tr!("AI 优化选中文字"), AiRegionMode::Polish),
-            ] {
-                let weak = menu_owner.clone();
-                let selected = snapshot.clone();
-                menu = menu.item(
-                    PopupMenuItem::new(label)
-                        .icon(icons::text_lines())
-                        .disabled(selected.is_none())
-                        .on_click(move |_, window, cx| {
-                            let Some(selected) = &selected else {
-                                return;
-                            };
-                            let _ = weak.update(cx, |this, cx| {
-                                if selected.matches_reader(
-                                    this.page,
-                                    this.reading,
-                                    this.read_generation,
-                                    this.preview.as_ref(),
-                                ) {
-                                    this.open_selection_editor(
-                                        selected.spans.clone(),
-                                        mode,
-                                        window,
-                                        cx,
-                                    );
-                                }
-                            });
-                        }),
-                );
+        );
+    with_reader_selection_menu(row, flow, SelectionTarget::Text(section, speech)).into_any_element()
+}
+
+#[derive(Clone, Copy)]
+enum SelectionTarget {
+    Text(usize, usize),
+    Image(usize),
+}
+
+fn with_reader_selection_menu(
+    row: Stateful<Div>,
+    flow: &NoteFlow,
+    target: SelectionTarget,
+) -> impl IntoElement {
+    let pressed = Rc::new(RefCell::new(None::<ReaderSelectionSnapshot>));
+    let press_snapshot = pressed.clone();
+    let press_owner = flow.desktop.clone();
+    let press_source = flow.preview.clone();
+    let menu_owner = flow.desktop.clone();
+    row.on_mouse_down(MouseButton::Right, move |_, _, cx| {
+        let snapshot = press_owner.upgrade().and_then(|owner| {
+            let this = owner.read(cx);
+            if this.page != Page::Result
+                || this.reading
+                || !this
+                    .preview
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &press_source))
+            {
+                return None;
             }
+            let selected = this.reader_ui.selection_generation == this.read_generation
+                && match target {
+                    SelectionTarget::Text(section, speech) => {
+                        this.reader_ui.selected.contains_key(&(section, speech))
+                    }
+                    SelectionTarget::Image(index) => {
+                        this.reader_ui.selected_images.contains_key(&index)
+                    }
+                };
+            let spans = this
+                .reader_ui
+                .selected
+                .iter()
+                .filter(|_| selected)
+                .map(|(&(section, speech), range)| SourceSpan {
+                    section,
+                    speech,
+                    start: range.start,
+                    end: range.end,
+                })
+                .collect();
+            Some(ReaderSelectionSnapshot {
+                images: this
+                    .reader_ui
+                    .selected_images
+                    .values()
+                    .filter(|_| selected)
+                    .cloned()
+                    .collect(),
+                spans,
+                preview: press_source.clone(),
+                generation: this.read_generation,
+            })
+        });
+        *press_snapshot.borrow_mut() = snapshot;
+    })
+    .context_menu(move |mut menu, _, _| {
+        let snapshot = pressed.borrow().clone();
+        for (label, mode) in [
+            (course2md::tr!("AI 清理选中文字"), AiRegionMode::Clean),
+            (course2md::tr!("AI 优化选中文字"), AiRegionMode::Polish),
+        ] {
             let weak = menu_owner.clone();
             let selected = snapshot.clone();
             menu = menu.item(
-                PopupMenuItem::new(course2md::tr!("对选中文字提问"))
+                PopupMenuItem::new(label)
                     .icon(icons::text_lines())
-                    .disabled(selected.is_none())
+                    .disabled(
+                        selected
+                            .as_ref()
+                            .is_none_or(|selected| selected.spans.is_empty()),
+                    )
                     .on_click(move |_, window, cx| {
                         let Some(selected) = &selected else {
                             return;
@@ -2026,31 +2035,96 @@ fn note_paragraph(flow: &NoteFlow, index: usize, text: &SharedString, anchor: &s
                                 this.read_generation,
                                 this.preview.as_ref(),
                             ) {
-                                this.ask_study_from_reader(selected.spans.clone(), window, cx);
+                                this.open_selection_editor(
+                                    selected.spans.clone(),
+                                    selected.images.clone(),
+                                    mode,
+                                    window,
+                                    cx,
+                                );
                             }
                         });
                     }),
             );
-            let quote = snapshot
-                .as_ref()
-                .map(|snapshot| {
-                    snapshot
-                        .spans
-                        .iter()
-                        .filter_map(|span| selected_text(&snapshot.preview.document, span))
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                })
-                .unwrap_or_default();
-            menu.item(
-                PopupMenuItem::new(course2md::tr!("复制"))
-                    .disabled(quote.is_empty())
+        }
+        if let SelectionTarget::Text(section, speech) = target {
+            let weak = menu_owner.clone();
+            let selected = snapshot.clone();
+            menu = menu.item(
+                PopupMenuItem::new(course2md::tr!("AI 翻译本段"))
+                    .icon(icons::text_lines())
                     .on_click(move |_, _, cx| {
-                        cx.write_to_clipboard(ClipboardItem::new_string(quote.clone()));
+                        let _ = weak.update(cx, |this, cx| {
+                            if selected.as_ref().is_some_and(|selection| {
+                                selection.matches_reader(
+                                    this.page,
+                                    this.reading,
+                                    this.read_generation,
+                                    this.preview.as_ref(),
+                                )
+                            }) {
+                                this.start_ai_region(
+                                    section,
+                                    speech,
+                                    AiRegionMode::Translate,
+                                    Vec::new(),
+                                    cx,
+                                );
+                            }
+                        });
                     }),
-            )
-        })
-        .into_any_element()
+            );
+        }
+        let weak = menu_owner.clone();
+        let selected = snapshot.clone();
+        menu = menu.item(
+            PopupMenuItem::new(course2md::tr!("对选中文字提问"))
+                .icon(icons::text_lines())
+                .disabled(
+                    selected
+                        .as_ref()
+                        .is_none_or(|selected| selected.spans.is_empty()),
+                )
+                .on_click(move |_, window, cx| {
+                    let Some(selected) = &selected else {
+                        return;
+                    };
+                    let _ = weak.update(cx, |this, cx| {
+                        if selected.matches_reader(
+                            this.page,
+                            this.reading,
+                            this.read_generation,
+                            this.preview.as_ref(),
+                        ) {
+                            this.ask_study_from_reader(
+                                selected.spans.clone(),
+                                selected.images.clone(),
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                }),
+        );
+        let quote = snapshot
+            .as_ref()
+            .map(|snapshot| {
+                snapshot
+                    .spans
+                    .iter()
+                    .filter_map(|span| selected_text(&snapshot.preview.document, span))
+                    .collect::<Vec<_>>()
+                    .join("\n\n")
+            })
+            .unwrap_or_default();
+        menu.item(
+            PopupMenuItem::new(course2md::tr!("复制"))
+                .disabled(quote.is_empty())
+                .on_click(move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(quote.clone()));
+                }),
+        )
+    })
 }
 
 /// `paragraph-<section>-<speech>` 锚点解析为写回所需的下标。
@@ -2516,65 +2590,101 @@ fn render_note_image(
             }
         }
     };
-    let open_click = open.clone();
     let time = frame.map(|frame| course2md::render::fmt_ts(frame.seconds));
-    flow.reveal(
-        ("reveal-note-image", index).into(),
-        div()
-            .id(("note-figure", index))
-            .relative()
-            .w_full()
-            .aspect_ratio(16. / 9.)
-            .rounded(FIGURE_RADIUS)
-            .overflow_hidden()
-            .bg(color(SURFACE_HIGH))
-            .when(frame.is_some(), |figure| {
-                figure
-                    .cursor_pointer()
-                    .on_click(move |_, window, cx| open_click(window, cx))
-            })
-            .map(|figure| match picture {
-                Some(Loaded::Ready(image, fresh)) => {
-                    let picture = img(image.clone())
-                        .absolute()
-                        .inset_0()
-                        .size_full()
-                        .rounded(FIGURE_RADIUS)
-                        .object_fit(ObjectFit::Contain);
-                    figure.child(if *fresh {
-                        crate::motion::enter(("figure-in", index), picture)
+    let figure = div()
+        .id(("note-figure", index))
+        .relative()
+        .w_full()
+        .aspect_ratio(16. / 9.)
+        .rounded(FIGURE_RADIUS)
+        .overflow_hidden()
+        .bg(color(SURFACE_HIGH))
+        .map(|figure| match picture {
+            Some(Loaded::Ready(image, fresh)) => {
+                let picture = img(image.clone())
+                    .absolute()
+                    .inset_0()
+                    .size_full()
+                    .rounded(FIGURE_RADIUS)
+                    .object_fit(ObjectFit::Contain);
+                figure.child(if *fresh {
+                    crate::motion::enter(("figure-in", index), picture)
+                } else {
+                    picture.into_any_element()
+                })
+            }
+            Some(Loaded::Failed) => figure.child(
+                unreadable_screenshot(("failed-reader-image", index))
+                    .absolute()
+                    .inset_0(),
+            ),
+            // The same quiet placeholder as the screenshot cards.
+            _ => figure.child(screenshot_placeholder()),
+        })
+        .children(time.map(image_time_chip))
+        .when(frame.is_some(), |figure| {
+            figure.child(
+                div()
+                    .absolute()
+                    .right(rems(12. / 14.))
+                    .bottom(rems(12. / 14.))
+                    .child(
+                        image_corner_button(("note-image", index), icons::maximize(), cx)
+                            .accessibility_label(course2md::tr!("放大{}", label))
+                            .tooltip(course2md::tr!("放大"))
+                            .on_click(move |_, window, cx| {
+                                // The figure under the button opens the viewer too.
+                                cx.stop_propagation();
+                                open(window, cx)
+                            }),
+                    ),
+            )
+        });
+    let desktop = flow.desktop.clone();
+    let source = flow.preview.clone();
+    let image_path = path.to_path_buf();
+    let selected = crate::note_text::NoteImage::new(
+        ("selectable-note-image", index),
+        path.to_string_lossy().into_owned(),
+        index as u64,
+        figure,
+        color(READING_SELECTION).into(),
+        FIGURE_RADIUS,
+        move |selected, _, cx| {
+            let _ = desktop.update(cx, |this, _| {
+                if this
+                    .preview
+                    .as_ref()
+                    .is_some_and(|current| Rc::ptr_eq(current, &source))
+                {
+                    if this.reader_ui.selection_generation != this.read_generation {
+                        this.reader_ui.selected.clear();
+                        this.reader_ui.selected_images.clear();
+                        this.reader_ui.selection_generation = this.read_generation;
+                    }
+                    if selected {
+                        this.reader_ui
+                            .selected_images
+                            .insert(index, image_path.clone());
                     } else {
-                        picture.into_any_element()
-                    })
+                        this.reader_ui.selected_images.remove(&index);
+                    }
                 }
-                Some(Loaded::Failed) => figure.child(
-                    unreadable_screenshot(("failed-reader-image", index))
-                        .absolute()
-                        .inset_0(),
-                ),
-                // The same quiet placeholder as the screenshot cards.
-                _ => figure.child(screenshot_placeholder()),
-            })
-            .children(time.map(image_time_chip))
-            .when(frame.is_some(), |figure| {
-                figure.child(
-                    div()
-                        .absolute()
-                        .right(rems(12. / 14.))
-                        .bottom(rems(12. / 14.))
-                        .child(
-                            image_corner_button(("note-image", index), icons::maximize(), cx)
-                                .accessibility_label(course2md::tr!("放大{}", label))
-                                .tooltip(course2md::tr!("放大"))
-                                .on_click(move |_, window, cx| {
-                                    // The figure under the button opens the viewer too.
-                                    cx.stop_propagation();
-                                    open(window, cx)
-                                }),
-                        ),
-                )
-            })
-            .into_any_element(),
+            });
+        },
+    );
+    // The popup must sit outside the image's focus-reveal wrapper: opening a
+    // menu on a partly visible figure must not scroll the underlying article.
+    with_reader_selection_menu(
+        div()
+            .id(("image-selection-menu", index))
+            .w_full()
+            .child(flow.reveal(
+                ("reveal-note-image", index).into(),
+                selected.into_any_element(),
+            )),
+        flow,
+        SelectionTarget::Image(index),
     )
     .into_any_element()
 }
@@ -7381,12 +7491,14 @@ impl Desktop {
         self.suspend_study();
         self.reader_ui.ai_edit.reset();
         self.reader_ui.selected.clear();
+        self.reader_ui.selected_images.clear();
         self.reader_ui.images.clear(cx);
     }
 
     pub(crate) fn reader_stop_ai_for_study(&mut self) {
         self.reader_ui.ai_edit.reset();
         self.reader_ui.selected.clear();
+        self.reader_ui.selected_images.clear();
     }
 
     /// Study paths were validated on the loading worker; drawing only uses the
@@ -8359,6 +8471,7 @@ mod ai_edit_tests {
         let (_temp, preview) = note();
         let preview = Rc::new(preview);
         let snapshot = ReaderSelectionSnapshot {
+            images: Vec::new(),
             spans: vec![SourceSpan {
                 section: 0,
                 speech: 0,

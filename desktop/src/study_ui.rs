@@ -54,7 +54,7 @@ impl Candidate {
 
 enum Operation {
     Organize(Vec<usize>),
-    Ask(Vec<SourceSpan>, String),
+    Ask(Vec<SourceSpan>, String, Vec<usize>),
     Summarize,
 }
 
@@ -73,6 +73,7 @@ pub(crate) struct StudyState {
     candidate: Option<Candidate>,
     selected: StudySelection,
     question_spans: Vec<SourceSpan>,
+    question_images: Vec<usize>,
     question_expanded: bool,
     question_origin: Option<String>,
     source_marks: Vec<SourceSpan>,
@@ -107,6 +108,7 @@ impl StudyState {
             candidate: None,
             selected: StudySelection::default(),
             question_spans: Vec::new(),
+            question_images: Vec::new(),
             question_expanded: false,
             question_origin: None,
             source_marks: Vec::new(),
@@ -247,6 +249,7 @@ impl Desktop {
             self.study_ui.organized_progress = None;
             self.study_ui.selected.clear();
             self.study_ui.question_spans.clear();
+            self.study_ui.question_images.clear();
             self.study_ui.question_origin = None;
             self.study_ui.error = None;
             self.study_ui.status = None;
@@ -269,6 +272,7 @@ impl Desktop {
     pub(crate) fn ask_study_from_reader(
         &mut self,
         spans: Vec<SourceSpan>,
+        images: Vec<PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -286,6 +290,21 @@ impl Desktop {
                 return;
             }
         };
+        let image_sections: Vec<usize> = images
+            .iter()
+            .filter_map(|path| {
+                preview
+                    .document
+                    .sections
+                    .iter()
+                    .position(|section| preview.course.dir.join(&section.image) == *path)
+            })
+            .collect();
+        if image_sections.len() != images.len() || image_sections.len() > 4 {
+            self.message = Some(course2md::tr!("学习请求过大，请缩小选区后重试").into());
+            cx.notify();
+            return;
+        }
         self.open_study(window, cx);
         if self
             .study_ui
@@ -299,6 +318,7 @@ impl Desktop {
             return;
         }
         self.study_ui.question_spans = spans;
+        self.study_ui.question_images = image_sections;
         self.study_ui.question_origin = Some(snapshot.source_digest);
         self.study_ui.question_expanded = true;
         self.study_ui.controls_scroll.scroll_to_bottom();
@@ -363,6 +383,7 @@ impl Desktop {
                                 ));
                             }
                             this.study_ui.question_spans.clear();
+                            this.study_ui.question_images.clear();
                             this.study_ui.question_origin = None;
                         }
                         this.study_ui.note = Some(Rc::new(note));
@@ -444,13 +465,19 @@ impl Desktop {
                         ));
                     }
                 }
-                Operation::Ask(spans, question) => {
-                    let text = course2md::study_ai::ask(
-                        &version, &note, &spans, &question, &settings, &control,
+                Operation::Ask(spans, question, images) => {
+                    let text = course2md::study_ai::ask_with_images(
+                        &version,
+                        &note,
+                        (&spans, (!images.is_empty()).then_some(images.as_slice())),
+                        &question,
+                        &settings,
+                        &control,
                     )?;
                     control.check()?;
                     crate::math::prepare(std::iter::once(text.as_str()));
-                    let answer = StudyAnswer::new(&note, spans, question, text)?;
+                    let mut answer = StudyAnswer::new(&note, spans, question, text)?;
+                    answer.image_sections = images;
                     let _ = tx.send_blocking(Update::Candidate(Candidate::Answer(answer)));
                 }
                 Operation::Summarize => {
@@ -488,6 +515,7 @@ impl Desktop {
                             if this.study_ui.enabled {
                                 this.study_ui.column = Column::Draft;
                                 this.study_ui.question_spans.clear();
+                                this.study_ui.question_images.clear();
                                 this.study_ui.redraw_rows();
                                 this.study_ui.list.scroll_to(ListOffset {
                                     item_ix: row,
@@ -585,6 +613,7 @@ impl Desktop {
         match note.quote(&spans) {
             Ok(_) => {
                 self.study_ui.question_spans = spans;
+                self.study_ui.question_images.clear();
                 self.study_ui.question_origin = Some(note.source_digest.clone());
                 self.study_ui.question_expanded = true;
                 self.study_ui.controls_scroll.scroll_to_bottom();
@@ -613,7 +642,10 @@ impl Desktop {
             cx.notify();
             return;
         }
-        self.run_study_ai(Operation::Ask(spans, question), cx);
+        self.run_study_ai(
+            Operation::Ask(spans, question, self.study_ui.question_images.clone()),
+            cx,
+        );
         if self.study_ui.pending.is_some() {
             self.study_ui.question_expanded = false;
         }
@@ -900,6 +932,33 @@ impl Desktop {
                 .as_ref()
                 .and_then(|note| note.quote(&self.study_ui.question_spans).ok())
                 .unwrap_or_default();
+            if !self.study_ui.question_images.is_empty() {
+                let times = self
+                    .study_ui
+                    .note
+                    .as_ref()
+                    .map(|note| {
+                        self.study_ui
+                            .question_images
+                            .iter()
+                            .filter_map(|id| note.source.sections.get(*id))
+                            .map(|section| course2md::render::fmt_ts(section.t))
+                            .collect::<Vec<_>>()
+                            .join(" · ")
+                    })
+                    .unwrap_or_default();
+                controls = controls.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(icons::image().size(TEXT_AUX))
+                        .child(course2md::tr!(
+                            "已选择 {} / 4 张",
+                            self.study_ui.question_images.len()
+                        ))
+                        .child(times),
+                );
+            }
             controls = controls.child(
                 quiet("study-toggle-question")
                     .icon(icons::message_square())
@@ -957,6 +1016,7 @@ impl Desktop {
                                         .disabled(busy)
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             this.study_ui.question_spans.clear();
+                                            this.study_ui.question_images.clear();
                                             cx.notify();
                                         })),
                                 ),
@@ -1337,8 +1397,11 @@ impl Desktop {
                     )
                     .text_color(color(GRAY)),
                 );
-            let targets: std::collections::BTreeSet<_> =
-                spans.iter().map(|span| span.section).collect();
+            let targets: std::collections::BTreeSet<_> = spans
+                .iter()
+                .map(|span| span.section)
+                .chain(answer.image_sections.iter().copied())
+                .collect();
             for (index, target) in targets.into_iter().enumerate() {
                 let marks = spans.clone();
                 let time = course2md::render::fmt_ts(note.source.sections[target].t);

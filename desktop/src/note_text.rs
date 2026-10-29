@@ -216,6 +216,7 @@ struct PlacedFormula {
 /// Shared between the element, its selection subscription and its copy.
 #[derive(Default)]
 struct Shared {
+    atomic: bool,
     source: SharedString,
     copy: Copy,
     snapshot: Option<TextSelectionSnapshot>,
@@ -346,6 +347,9 @@ impl Shared {
     }
 
     fn source_selection(&self, snapshot: TextSelectionSnapshot) -> Option<Range<usize>> {
+        if self.atomic {
+            return Some(0..self.source.len());
+        }
         if let Paragraph::Selected(range) = &self.paragraph {
             return merged_source_range(&self.source, [range.clone()]);
         }
@@ -393,6 +397,9 @@ impl Shared {
 
     /// The copied text for the current selection, from the current content.
     fn copied(&self) -> String {
+        if self.atomic {
+            return String::new();
+        }
         if self.on_selection.is_some()
             && self.snapshot.map(SelectionKey::from) == self.selection_key
             && let Some(range) = &self.selected_source
@@ -1474,6 +1481,140 @@ impl Element for NoteText {
     }
 }
 
+/// A whole image participates in the same ordered drag selection as source text.
+/// The source key binds retained state to the actual image/version, not its row.
+pub struct NoteImage {
+    id: ElementId,
+    source: SharedString,
+    order: u64,
+    child: AnyElement,
+    selection_color: Hsla,
+    radius: Pixels,
+    callback: SelectionCallback,
+}
+
+impl NoteImage {
+    pub fn new(
+        id: impl Into<ElementId>,
+        source: impl Into<SharedString>,
+        order: u64,
+        child: impl IntoElement,
+        selection_color: Hsla,
+        radius: Pixels,
+        callback: impl Fn(bool, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            source: source.into(),
+            order,
+            child: child.into_any_element(),
+            selection_color,
+            radius,
+            callback: Rc::new(move |range, window, cx| callback(range.is_some(), window, cx)),
+        }
+    }
+}
+
+impl IntoElement for NoteImage {
+    type Element = Self;
+    fn into_element(self) -> Self {
+        self
+    }
+}
+
+pub struct NoteImageLayout(TextSelectionHandle, Rc<RefCell<Shared>>);
+
+impl Element for NoteImage {
+    type RequestLayoutState = NoteImageLayout;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.id.clone())
+    }
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let window_handle = window.window_handle();
+        let state =
+            window.with_element_state(id.expect("image identity"), |old: Option<Retained>, _| {
+                let retained = old
+                    .filter(|old| old.source == self.source && old.document_order == self.order)
+                    .unwrap_or_else(|| {
+                        Retained::new(self.source.clone(), self.order, true, window_handle, cx)
+                    });
+                ((retained.handle.clone(), retained.shared.clone()), retained)
+            });
+        {
+            let mut shared = state.1.borrow_mut();
+            shared.atomic = true;
+            shared.source = self.source.clone();
+            shared.on_selection = Some(self.callback.clone());
+        }
+        SOURCE_SELECTIONS.with(|entries| {
+            let mut entries = entries.borrow_mut();
+            entries.retain(|_, shared| shared.strong_count() > 0);
+            entries.insert(state.0.entity_id(), Rc::downgrade(&state.1));
+        });
+        (
+            self.child.request_layout(window, cx),
+            NoteImageLayout(state.0, state.1),
+        )
+    }
+
+    fn prepaint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+        state.0.register(
+            TextSelectionRegistration::new(hitbox, bounds)
+                .with_document_order(self.order)
+                .with_text_bounds(vec![bounds]),
+            window,
+            cx,
+        );
+        self.child.prepaint(window, cx);
+    }
+
+    fn paint(
+        &mut self,
+        _: Option<&GlobalElementId>,
+        _: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        state: &mut Self::RequestLayoutState,
+        _: &mut (),
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.child.paint(window, cx);
+        let selected = state.1.borrow().snapshot.is_some_and(source_endpoints);
+        if selected {
+            window.paint_quad(PaintQuad {
+                bounds,
+                background: self.selection_color.into(),
+                corner_radii: Corners::all(self.radius),
+                border_widths: Edges::default(),
+                border_color: transparent_black(),
+                border_style: Default::default(),
+            });
+        }
+        queue_selection(&state.1, window.window_handle(), cx);
+    }
+}
+
 /// One block's text: its selection, the text, then the formulas over it.
 struct Line {
     text: StyledText,
@@ -2432,5 +2573,165 @@ mod selection_tests {
         cx.update(TextSelection::clear);
         cx.run_until_parked();
         assert!(observed.borrow().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod image_selection_tests {
+    use super::*;
+    use gpui::{Context, MouseButton, Render, TestAppContext, VisualTestContext, point};
+    use gpui_base::{TextSelection, TextSelectionLayer};
+
+    struct Harness {
+        visible: bool,
+        image_key: SharedString,
+        width: f32,
+        image: Rc<std::cell::Cell<bool>>,
+        text: Rc<RefCell<HashMap<usize, Range<usize>>>>,
+    }
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let before = self.text.clone();
+            let after = self.text.clone();
+            let image = self.image.clone();
+            div().size_full().child(TextSelectionLayer).child(
+                div()
+                    .flex()
+                    .gap_8()
+                    .child(
+                        div()
+                            .w(px(self.width))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                NoteText::new("before-image", "Before picture text")
+                                    .document_order(0)
+                                    .on_selection(move |range, _, _| {
+                                        if let Some(range) = range {
+                                            before.borrow_mut().insert(0, range);
+                                        } else {
+                                            before.borrow_mut().remove(&0);
+                                        }
+                                    }),
+                            )
+                            .when(self.visible, |view| {
+                                view.child(NoteImage::new(
+                                    "drag-image",
+                                    self.image_key.clone(),
+                                    1,
+                                    div()
+                                        .debug_selector(|| "image-bounds".into())
+                                        .w_full()
+                                        .h(px(100.))
+                                        .bg(gpui::rgb(0xdddddd)),
+                                    gpui::rgba(0x5577aa66).into(),
+                                    px(8.),
+                                    move |selected, _, _| image.set(selected),
+                                ))
+                            })
+                            .child(
+                                NoteText::new("after-image", "After picture text")
+                                    .document_order(2)
+                                    .on_selection(move |range, _, _| {
+                                        if let Some(range) = range {
+                                            after.borrow_mut().insert(2, range);
+                                        } else {
+                                            after.borrow_mut().remove(&2);
+                                        }
+                                    }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .w(px(200.))
+                            .child(NoteText::new("non-source", "Other column").document_order(10)),
+                    ),
+            )
+        }
+    }
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+    }
+    fn drag(cx: &mut VisualTestContext, a: Point<Pixels>, b: Point<Pixels>) {
+        cx.simulate_mouse_down(a, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(b, Some(MouseButton::Left), Default::default());
+        cx.simulate_mouse_up(b, MouseButton::Left, Default::default());
+        draw(cx);
+    }
+    #[gpui::test]
+    fn image_drag_shares_source_selection_in_both_directions_and_clears(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, _| Harness {
+            visible: true,
+            image_key: "first.png".into(),
+            width: 250.,
+            image: Default::default(),
+            text: Default::default(),
+        });
+        draw(cx);
+        let (image, text) =
+            cx.update(|_, cx| (view.read(cx).image.clone(), view.read(cx).text.clone()));
+        let bounds = cx.debug_bounds("image-bounds").unwrap();
+        let inside = bounds.center();
+        let below = point(px(50.), bounds.bottom() + px(10.));
+        for (a, b) in [(inside, below), (below, inside)] {
+            drag(cx, a, b);
+            assert!(image.get(), "image endpoint must participate");
+            assert!(
+                text.borrow()
+                    .get(&2)
+                    .is_some_and(|r| r.start == 0 && r.end > 0)
+            );
+            assert!(!text.borrow().contains_key(&0));
+        }
+        drag(cx, point(px(50.), px(10.)), below);
+        assert!(image.get(), "image between text endpoints must participate");
+        assert_eq!(text.borrow().len(), 2);
+        cx.simulate_mouse_down(inside, MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(inside, MouseButton::Right, Default::default());
+        draw(cx);
+        assert!(image.get(), "right click must preserve image selection");
+        drag(cx, inside, inside + point(px(20.), px(20.)));
+        assert!(image.get(), "image-only drag must select the whole image");
+        assert!(text.borrow().is_empty());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.width = 180.;
+                cx.notify();
+            })
+        });
+        draw(cx);
+        assert!(image.get(), "reflow retains image selection");
+        cx.update(TextSelection::clear);
+        draw(cx);
+        assert!(!image.get());
+        // A non-source endpoint must never provide an AI source image.
+        let inside = cx.debug_bounds("image-bounds").unwrap().center();
+        drag(cx, inside, point(px(300.), px(10.)));
+        assert!(!image.get());
+        assert!(text.borrow().is_empty());
+        drag(cx, inside, inside + point(px(20.), px(20.)));
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.image_key = "replacement.png".into();
+                cx.notify();
+            })
+        });
+        draw(cx);
+        assert!(
+            !image.get(),
+            "recycled identity cannot keep the previous image"
+        );
+        drag(cx, inside, inside + point(px(20.), px(20.)));
+        assert!(image.get());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.visible = false;
+                cx.notify();
+            })
+        });
+        draw(cx);
+        assert!(!image.get(), "unmount clears the aggregate");
     }
 }

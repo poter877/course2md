@@ -20,10 +20,15 @@ use gpui::{
     prelude::*, px, rems, transparent_black,
 };
 use gpui_base::{
-    TextSelectionEvent, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun,
-    TextSelectionSnapshot,
+    TextSelectionCoverage, TextSelectionEndpoint, TextSelectionEvent, TextSelectionHandle,
+    TextSelectionRegistration, TextSelectionRun, TextSelectionSnapshot,
 };
-use std::{cell::RefCell, ops::Range, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    ops::Range,
+    rc::{Rc, Weak},
+};
 
 /// Holds an inline formula's place in the text: wraps neither inside nor
 /// next to it, and is measured to the formula's width.
@@ -57,6 +62,7 @@ pub enum Copy {
 }
 
 type SourcePosition = Box<dyn FnOnce(Point<Pixels>, Pixels)>;
+type SelectionCallback = Rc<dyn Fn(Option<Range<usize>>, &mut Window, &mut App)>;
 
 /// Selectable note text; see the module documentation.
 pub struct NoteText {
@@ -66,6 +72,7 @@ pub struct NoteText {
     document_order: u64,
     highlights: Vec<(Range<usize>, HighlightStyle)>,
     source_position: Option<(usize, SourcePosition)>,
+    on_selection: Option<SelectionCallback>,
     selection_color: Hsla,
     surface: Hsla,
     group: Option<SharedString>,
@@ -82,6 +89,7 @@ impl NoteText {
             document_order: 0,
             highlights: Vec::new(),
             source_position: None,
+            on_selection: None,
             selection_color: transparent_black(),
             surface: crate::theme::color(crate::theme::SURFACE).into(),
             group: None,
@@ -120,6 +128,25 @@ impl NoteText {
 
     pub fn selection_color(mut self, color: Hsla) -> Self {
         self.selection_color = color;
+        self
+    }
+
+    /// Observes this element's selected **source byte span**, without copy labels,
+    /// list prefixes or appended newlines. Formula delimiters are included.
+    /// Cross-element selections report separately to each participating element;
+    /// aggregate them by stable document/block identity, clearing only that block
+    /// on `None`. Reflow preserves the source span; clearing, unmounting or replacing
+    /// the content reports `None` after a previously reported selection.
+    ///
+    /// Opt in only the source column. Both gesture endpoints must belong to opted-in
+    /// elements, so selecting ordinary text in another column cannot supply source.
+    /// Use distinct stable element IDs for notes/versions/columns and clear the
+    /// caller's aggregate when navigating. Callbacks run outside layout/paint.
+    pub fn on_selection(
+        mut self,
+        callback: impl Fn(Option<Range<usize>>, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.on_selection = Some(Rc::new(callback));
         self
     }
 
@@ -185,6 +212,75 @@ struct Shared {
     painted: Vec<Option<Range<usize>>>,
     /// A triple click's whole paragraph, when it spans formula rows.
     paragraph: Paragraph,
+    on_selection: Option<SelectionCallback>,
+    selection_key: Option<SelectionKey>,
+    selected_source: Option<Range<usize>>,
+    reported_source: Option<Range<usize>>,
+}
+
+/// Geometry changes alone must not reinterpret a finished selection after reflow.
+#[derive(Clone, Copy, PartialEq)]
+struct SelectionKey {
+    anchor: TextSelectionEndpoint,
+    cursor: TextSelectionEndpoint,
+    coverage: TextSelectionCoverage,
+}
+
+impl From<TextSelectionSnapshot> for SelectionKey {
+    fn from(snapshot: TextSelectionSnapshot) -> Self {
+        Self {
+            anchor: snapshot.anchor(),
+            cursor: snapshot.cursor(),
+            coverage: snapshot.coverage(),
+        }
+    }
+}
+
+thread_local! {
+    // Weak entries never keep virtualized paragraphs or their callbacks alive.
+    static SOURCE_SELECTIONS: RefCell<HashMap<gpui::EntityId, Weak<RefCell<Shared>>>> =
+        RefCell::default();
+}
+
+fn source_endpoints(snapshot: TextSelectionSnapshot) -> bool {
+    SOURCE_SELECTIONS.with(|entries| {
+        let entries = entries.borrow();
+        [snapshot.anchor(), snapshot.cursor()]
+            .into_iter()
+            .all(|endpoint| {
+                endpoint
+                    .entity_id()
+                    .and_then(|id| entries.get(&id))
+                    .and_then(Weak::upgrade)
+                    .is_some()
+            })
+    })
+}
+
+fn merged_source_range(
+    source: &str,
+    ranges: impl IntoIterator<Item = Range<usize>>,
+) -> Option<Range<usize>> {
+    ranges
+        .into_iter()
+        .filter(|range| !range.is_empty() && source.get(range.clone()).is_some())
+        .reduce(|a, b| a.start.min(b.start)..a.end.max(b.end))
+}
+
+fn queue_selection(shared: &Rc<RefCell<Shared>>, window: gpui::AnyWindowHandle, cx: &mut App) {
+    if shared.borrow().on_selection.is_none() {
+        return;
+    }
+    let shared = Rc::downgrade(shared);
+    cx.defer(move |cx| {
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        let change = shared.borrow_mut().selection_change();
+        if let Some((callback, range)) = change {
+            let _ = window.update(cx, |_, window, cx| callback(range, window, cx));
+        }
+    });
 }
 
 /// Window text selection selects the line under a triple click within one
@@ -211,12 +307,55 @@ impl Shared {
                 };
             }
             TextSelectionEvent::Cleared => {
+                self.snapshot = None;
+                self.selection_key = None;
+                self.selected_source = None;
                 if let Paragraph::Selected(_) = self.paragraph {
                     self.paragraph = Paragraph::None;
                 }
             }
             TextSelectionEvent::AutoScroll(_) => {}
         }
+    }
+
+    fn selection_change(&mut self) -> Option<(SelectionCallback, Option<Range<usize>>)> {
+        let callback = self.on_selection.clone()?;
+        let snapshot = self.snapshot.filter(|snapshot| source_endpoints(*snapshot));
+        let key = snapshot.map(SelectionKey::from);
+        if key != self.selection_key {
+            self.selected_source = snapshot.and_then(|snapshot| self.source_selection(snapshot));
+            self.selection_key = key;
+        }
+        if self.reported_source == self.selected_source {
+            return None;
+        }
+        self.reported_source = self.selected_source.clone();
+        Some((callback, self.selected_source.clone()))
+    }
+
+    fn source_selection(&self, snapshot: TextSelectionSnapshot) -> Option<Range<usize>> {
+        if let Paragraph::Selected(range) = &self.paragraph {
+            return merged_source_range(&self.source, [range.clone()]);
+        }
+        if snapshot.coverage() == TextSelectionCoverage::Full {
+            return merged_source_range(&self.source, std::iter::once(0..self.source.len()));
+        }
+        let points = snapshot.window_points()?;
+        let mut range = merged_source_range(
+            &self.source,
+            self.runs.iter().filter_map(|(text, layout, segments)| {
+                source_range(
+                    segments,
+                    selected_range(text, layout, points.anchor(), points.cursor())?,
+                )
+            }),
+        )?;
+        match snapshot.coverage() {
+            TextSelectionCoverage::FromStart => range.start = 0,
+            TextSelectionCoverage::ToEnd => range.end = self.source.len(),
+            _ => {}
+        }
+        Some(range)
     }
 
     /// The source paragraph (text between blank lines) under `position`,
@@ -242,6 +381,12 @@ impl Shared {
 
     /// The copied text for the current selection, from the current content.
     fn copied(&self) -> String {
+        if self.on_selection.is_some()
+            && self.snapshot.map(SelectionKey::from) == self.selection_key
+            && let Some(range) = &self.selected_source
+        {
+            return copied_text(&self.source, &self.copy, std::slice::from_ref(range));
+        }
         if let Paragraph::Selected(range) = &self.paragraph {
             return copied_text(&self.source, &self.copy, std::slice::from_ref(range));
         }
@@ -267,27 +412,66 @@ struct Retained {
     /// Scroll positions of the formula rows, in order.
     rows: Vec<gpui::ScrollHandle>,
     _subscription: Subscription,
+    source: SharedString,
+    document_order: u64,
+    observing: bool,
+    _observer_lifetime: Option<gpui::Entity<Rc<RefCell<Shared>>>>,
 }
 
 impl Retained {
-    fn new(source: SharedString, cx: &mut App) -> Self {
-        let handle = TextSelectionHandle::new(source, cx);
+    fn new(
+        source: SharedString,
+        document_order: u64,
+        observing: bool,
+        window_handle: gpui::AnyWindowHandle,
+        cx: &mut App,
+    ) -> Self {
+        let handle = TextSelectionHandle::new(source.clone(), cx);
         let shared = Rc::new(RefCell::new(Shared::default()));
         let selection = shared.clone();
         let subscription = handle.subscribe(
-            move |event, _| {
+            move |event, cx| {
                 selection.borrow_mut().selection_event(event);
+                if !matches!(event, TextSelectionEvent::AutoScroll(_)) {
+                    queue_selection(&selection, window_handle, cx);
+                }
             },
             cx,
         );
         let copied = shared.clone();
         handle.copy_with(move |_| copied.borrow().copied(), cx);
+        let observer_lifetime = observing.then(|| {
+            let lifetime = cx.new(|_| shared.clone());
+            let id = handle.entity_id();
+            cx.observe_release(&lifetime, move |shared, cx| {
+                SOURCE_SELECTIONS.with(|entries| entries.borrow_mut().remove(&id));
+                let callback = {
+                    let mut shared = shared.borrow_mut();
+                    shared
+                        .reported_source
+                        .take()
+                        .and(shared.on_selection.clone())
+                };
+                if let Some(callback) = callback {
+                    cx.defer(move |cx| {
+                        let _ =
+                            window_handle.update(cx, |_, window, cx| callback(None, window, cx));
+                    });
+                }
+            })
+            .detach();
+            lifetime
+        });
         Self {
             handle,
             shared,
             width: None,
             rows: Vec::new(),
             _subscription: subscription,
+            source,
+            document_order,
+            observing,
+            _observer_lifetime: observer_lifetime,
         }
     }
 }
@@ -513,7 +697,10 @@ pub fn piece_sources(text: &str) -> Vec<(Range<usize>, crate::math::Piece<'_>)> 
 pub fn source_range(segments: &[Segment], display: Range<usize>) -> Option<Range<usize>> {
     let mut found: Option<Range<usize>> = None;
     for segment in segments {
-        if segment.display.end <= display.start || display.end <= segment.display.start {
+        if segment.source.is_empty()
+            || segment.display.end <= display.start
+            || display.end <= segment.display.start
+        {
             continue;
         }
         let part = if segment.atomic {
@@ -801,10 +988,26 @@ impl Element for NoteText {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, NoteTextLayout) {
+        let window_handle = window.window_handle();
         let (handle, shared, own_width) = window.with_element_state(
             global_id.expect("note text has a stable element id"),
             |retained: Option<Retained>, _| {
-                let retained = retained.unwrap_or_else(|| Retained::new(self.source.clone(), cx));
+                let observing = self.on_selection.is_some() && !self.preview;
+                let retained = retained
+                    .filter(|retained| {
+                        retained.source == self.source
+                            && retained.document_order == self.document_order
+                            && retained.observing == observing
+                    })
+                    .unwrap_or_else(|| {
+                        Retained::new(
+                            self.source.clone(),
+                            self.document_order,
+                            observing,
+                            window_handle,
+                            cx,
+                        )
+                    });
                 (
                     (
                         retained.handle.clone(),
@@ -815,6 +1018,14 @@ impl Element for NoteText {
                 )
             },
         );
+        shared.borrow_mut().on_selection = self.on_selection.clone().filter(|_| !self.preview);
+        if self.on_selection.is_some() && !self.preview {
+            SOURCE_SELECTIONS.with(|entries| {
+                let mut entries = entries.borrow_mut();
+                entries.retain(|_, shared| shared.strong_count() > 0);
+                entries.insert(handle.entity_id(), Rc::downgrade(&shared));
+            });
+        }
         // Before its first layout, a paragraph assumes the width last found
         // for its group (the article column, the viewer), so a formula too
         // wide for the line takes its row from the first frame.
@@ -1206,7 +1417,15 @@ impl Element for NoteText {
                         .then(|| widened(&state.blocks[index].segments, start..range.end))
                 })
                 .collect();
-            if let Paragraph::Selected(paragraph) = &shared.paragraph {
+            let stable_range = (shared.on_selection.is_some()
+                && shared.snapshot.map(SelectionKey::from) == shared.selection_key)
+                .then_some(shared.selected_source.as_ref())
+                .flatten();
+            let paragraph = match &shared.paragraph {
+                Paragraph::Selected(paragraph) => Some(paragraph),
+                _ => stable_range,
+            };
+            if let Some(paragraph) = paragraph {
                 shared.painted = state
                     .blocks
                     .iter()
@@ -1233,6 +1452,9 @@ impl Element for NoteText {
         }
         if let Some(child) = &mut self.child {
             child.paint(window, cx);
+        }
+        if self.on_selection.is_some() {
+            queue_selection(&state.shared, window.window_handle(), cx);
         }
     }
 }
@@ -1718,5 +1940,317 @@ mod tests {
         assert!(fits_inline(px(100.), None, px(4.)));
         assert!(fits_inline(px(100.), Some(px(200.)), px(4.)));
         assert!(!fits_inline(px(199.), Some(px(200.)), px(4.)));
+    }
+
+    #[test]
+    fn observed_source_ranges_exclude_labels_and_keep_utf8_and_formula_delimiters() {
+        let source = "甲🙂 $x$\n\n第二段\n$$y^2$$\n完";
+        let blocks = plan(source, Some("说明："), inline);
+        assert_eq!(source_range(&blocks[0].segments, 0.."说明：".len()), None);
+        let selected = merged_source_range(
+            source,
+            blocks
+                .iter()
+                .filter_map(|block| source_range(&block.segments, 0..block.display.len())),
+        )
+        .unwrap();
+        assert_eq!(selected, 0..source.len());
+        let holder = &blocks[0].formulas[0].0;
+        let formula = source_range(&blocks[0].segments, holder.start..holder.start + 1).unwrap();
+        assert_eq!(&source[formula], "$x$");
+        assert_eq!(merged_source_range(source, [1..2, 0..3, 3..7]), Some(0..7));
+        assert_eq!(
+            merged_source_range(source, [0..0, 1..2, 0..usize::MAX]),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use gpui::{Context, MouseButton, Render, TestAppContext, VisualTestContext, point};
+    use gpui_base::{TextSelection, TextSelectionLayer};
+
+    type Observed = Rc<RefCell<HashMap<usize, Range<usize>>>>;
+    type SelectionEvents = Rc<RefCell<Vec<(usize, Option<Range<usize>>)>>>;
+
+    struct Harness {
+        sources: [SharedString; 2],
+        visible: bool,
+        width: f32,
+        observed: Observed,
+        events: SelectionEvents,
+    }
+
+    impl Render for Harness {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let left = self
+                .sources
+                .iter()
+                .enumerate()
+                .map(|(index, source)| {
+                    let observed = self.observed.clone();
+                    let events = self.events.clone();
+                    div().w(px(self.width)).child(
+                        NoteText::new(("original", index), source.clone())
+                            .document_order(index as u64)
+                            .copy(Copy::Labeled("Label: ".into()))
+                            .on_selection(move |range, _, _| {
+                                events.borrow_mut().push((index, range.clone()));
+                                if let Some(range) = range {
+                                    observed.borrow_mut().insert(index, range);
+                                } else {
+                                    observed.borrow_mut().remove(&index);
+                                }
+                            }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            div()
+                .size_full()
+                .text_size(px(16.))
+                .line_height(px(24.))
+                .child(TextSelectionLayer)
+                .when(self.visible, |view| {
+                    view.child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .w(px(self.width))
+                            .children(left),
+                    )
+                })
+                .child(
+                    div().absolute().left(px(350.)).top_0().w(px(240.)).child(
+                        NoteText::new("reply", "Right column answer text").document_order(100),
+                    ),
+                )
+        }
+    }
+
+    fn harness(cx: &mut TestAppContext) -> (gpui::Entity<Harness>, &mut VisualTestContext) {
+        cx.add_window_view(|_, _| Harness {
+            sources: [
+                "甲🙂 alpha beta gamma delta".into(),
+                "第二段 epsilon zeta".into(),
+            ],
+            visible: true,
+            width: 250.,
+            observed: Default::default(),
+            events: Default::default(),
+        })
+    }
+
+    fn draw(cx: &mut VisualTestContext) {
+        cx.update(|window, cx| {
+            window.draw(cx).clear(cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn position(source: &str, byte: usize) -> Point<Pixels> {
+        SOURCE_SELECTIONS.with(|entries| {
+            entries
+                .borrow()
+                .values()
+                .filter_map(Weak::upgrade)
+                .find_map(|shared| {
+                    let shared = shared.borrow();
+                    if shared.source.as_ref() != source {
+                        return None;
+                    }
+                    shared.runs.iter().find_map(|(_, layout, segments)| {
+                        let index = display_index(segments, byte)?;
+                        let mut point = layout.position_for_index(index)?;
+                        point.y += layout.line_height() / 2.;
+                        Some(point)
+                    })
+                })
+                .expect("source was painted")
+        })
+    }
+
+    fn drag(cx: &mut VisualTestContext, start: Point<Pixels>, end: Point<Pixels>) {
+        cx.simulate_mouse_down(start, MouseButton::Left, Default::default());
+        cx.simulate_mouse_move(end, Some(MouseButton::Left), Default::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn callback_tracks_cross_paragraph_utf8_ranges_and_reverse_drag(cx: &mut TestAppContext) {
+        let (view, cx) = harness(cx);
+        draw(cx);
+        let (sources, observed) = cx.update(|_, cx| {
+            (
+                view.read(cx).sources.clone(),
+                view.read(cx).observed.clone(),
+            )
+        });
+        let start = position(&sources[0], "甲🙂 ".len());
+        let end = position(&sources[1], "第二段 epsilon".len());
+        drag(cx, start, end);
+        assert_eq!(
+            observed.borrow().get(&0),
+            Some(&("甲🙂 ".len()..sources[0].len()))
+        );
+        assert_eq!(
+            observed.borrow().get(&1),
+            Some(&(0.."第二段 epsilon".len()))
+        );
+        drag(cx, end, start);
+        assert_eq!(
+            observed.borrow().get(&0),
+            Some(&("甲🙂 ".len()..sources[0].len()))
+        );
+        assert_eq!(
+            observed.borrow().get(&1),
+            Some(&(0.."第二段 epsilon".len()))
+        );
+    }
+
+    #[gpui::test]
+    fn callback_survives_reflow_and_clears_without_clipboard_or_right_column_leaks(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = harness(cx);
+        draw(cx);
+        let (sources, observed, events) = cx.update(|_, cx| {
+            let state = view.read(cx);
+            (
+                state.sources.clone(),
+                state.observed.clone(),
+                state.events.clone(),
+            )
+        });
+        let start = position(&sources[0], "甲🙂 ".len());
+        let end = position(&sources[0], "甲🙂 alpha beta".len());
+        drag(cx, start, end);
+        let before = observed.borrow().clone();
+        assert!(!before.is_empty());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.width = 100.;
+                cx.notify();
+            })
+        });
+        draw(cx);
+        assert_eq!(*observed.borrow(), before);
+        cx.update(TextSelection::clear);
+        cx.run_until_parked();
+        assert!(observed.borrow().is_empty());
+        events.borrow_mut().clear();
+        drag(cx, point(px(360.), px(10.)), point(px(450.), px(10.)));
+        assert!(observed.borrow().is_empty());
+        drag(cx, point(px(360.), px(10.)), position(&sources[1], 3));
+        assert!(observed.borrow().is_empty());
+        assert!(events.borrow().iter().all(|(_, range)| range.is_none()));
+        drag(cx, position(&sources[1], 0), point(px(450.), px(10.)));
+        assert!(observed.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn recycled_or_unmounted_paragraphs_clear_previous_callback(cx: &mut TestAppContext) {
+        let (view, cx) = harness(cx);
+        draw(cx);
+        let (sources, observed) = cx.update(|_, cx| {
+            (
+                view.read(cx).sources.clone(),
+                view.read(cx).observed.clone(),
+            )
+        });
+        drag(
+            cx,
+            position(&sources[0], 0),
+            position(&sources[0], "甲🙂 alpha".len()),
+        );
+        assert!(!observed.borrow().is_empty());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.sources[0] = "replacement text".into();
+                cx.notify();
+            })
+        });
+        draw(cx);
+        assert!(observed.borrow().is_empty());
+        drag(
+            cx,
+            position("replacement text", 0),
+            position("replacement text", 11),
+        );
+        assert!(!observed.borrow().is_empty());
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.visible = false;
+                cx.notify();
+            })
+        });
+        draw(cx);
+        draw(cx);
+        assert!(observed.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn formula_drag_and_triple_click_report_original_source(cx: &mut TestAppContext) {
+        let (view, cx) = harness(cx);
+        let source = "前文 $x+1$ 后文\n$$y^2$$\n末尾\n\n下一段";
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.sources[0] = source.into();
+                cx.notify();
+            })
+        });
+        draw(cx);
+        let observed = cx.update(|_, cx| view.read(cx).observed.clone());
+        let (start, end) = SOURCE_SELECTIONS.with(|entries| {
+            entries
+                .borrow()
+                .values()
+                .filter_map(Weak::upgrade)
+                .find_map(|shared| {
+                    let shared = shared.borrow();
+                    if shared.source.as_ref() != source {
+                        return None;
+                    }
+                    shared.runs.iter().find_map(|(_, layout, segments)| {
+                        let segment = segments.iter().find(|segment| {
+                            segment.atomic && &source[segment.source.clone()] == "$$y^2$$"
+                        })?;
+                        let mut start = layout.position_for_index(segment.display.start)?;
+                        let mut end = layout.position_for_index(segment.display.end)?;
+                        start.y += layout.line_height() / 2.;
+                        end.y = start.y;
+                        Some((start, end))
+                    })
+                })
+                .expect("display formula has a selectable source segment")
+        });
+        drag(cx, start, end);
+        let range = observed.borrow().get(&0).cloned().unwrap();
+        assert_eq!(&source[range], "$$y^2$$");
+        let click = position(source, 0);
+        cx.simulate_event(MouseDownEvent {
+            position: click,
+            button: MouseButton::Left,
+            click_count: 3,
+            modifiers: Default::default(),
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: click,
+            button: MouseButton::Left,
+            click_count: 3,
+            modifiers: Default::default(),
+        });
+        draw(cx);
+        assert_eq!(
+            observed.borrow().get(&0),
+            Some(&(0..source.find("\n\n").unwrap()))
+        );
+        cx.update(TextSelection::clear);
+        cx.run_until_parked();
+        assert!(observed.borrow().is_empty());
     }
 }

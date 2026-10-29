@@ -464,25 +464,37 @@ pub fn parse_subtitle(content: &str) -> Vec<TranscriptEvent> {
                 continue;
             }
             let mut text_parts: Vec<String> = vec![];
+            let mut source_parts: Vec<String> = vec![];
             while i < lines.len() && !lines[i].trim().is_empty() {
-                let cleaned = clean_cue_text(lines[i]);
+                let source = clean_cue_text(lines[i]);
+                let spoken_line = without_speaker_marker(lines[i]);
+                let cleaned = if spoken_line == lines[i].trim() {
+                    source.clone()
+                } else {
+                    clean_cue_text(spoken_line)
+                };
+                if !source.is_empty() {
+                    source_parts.push(source);
+                }
                 if !cleaned.is_empty() {
                     text_parts.push(cleaned);
                 }
                 i += 1;
             }
             let text = text_parts.join(" ");
+            let source = source_parts.join(" ");
+            let raw = (source != text).then_some(source);
             // 滚动字幕去重：相邻 cue 文本相同则只保留首个（并延长时长）
             if !text.is_empty() {
                 match out.last_mut() {
-                    Some(prev) if prev.text == text && start <= prev.end => {
+                    Some(prev) if prev.text == text && prev.raw == raw && start <= prev.end => {
                         prev.end = end.max(prev.end)
                     }
                     _ => out.push(TranscriptEvent {
                         start,
                         end,
                         text,
-                        raw: None,
+                        raw,
                         translation: None,
                     }),
                 }
@@ -613,6 +625,27 @@ fn clean_cue_text(line: &str) -> String {
         s = s.replace(from, to);
     }
     s.trim().to_string()
+}
+
+/// Caption speaker changes are written as a literal `>>` at the start of a
+/// line. Handle them before joining cues, where their boundary would be lost.
+/// Encoded literals, shifts inside a sentence, numeric operands, and `>>>`
+/// prompts are not speaker markers. Keep the unmodified cue in `raw` above.
+fn without_speaker_marker(line: &str) -> &str {
+    let line = line.trim();
+    let Some(rest) = line.strip_prefix(">>") else {
+        return line;
+    };
+    if rest.is_empty() {
+        return "";
+    }
+    if rest.starts_with(char::is_whitespace) {
+        let speech = rest.trim_start();
+        if speech.is_empty() || speech.starts_with(char::is_alphabetic) {
+            return speech;
+        }
+    }
+    line
 }
 
 /// 在已有目录中挑一个字幕文件。新调用方会把确定的一条字幕抓取到独立目录；
@@ -911,6 +944,64 @@ second cue
             assert_eq!(clean_cue_text(text), text);
         }
         assert_eq!(clean_cue_text("x < 3 <b>且</b> y > 2"), "x < 3 且 y > 2");
+    }
+
+    #[test]
+    fn speaker_prefixes_are_removed_before_cues_join_and_originals_are_retained() {
+        let cues = parse_subtitle(
+            "1\n00:00:12,000 --> 00:00:13,599\n>> Sorry. Ask what?\n\n\
+             2\n00:00:13,599 --> 00:00:15,440\n>> Uh you might want to ask\nthe people to chat.\n\n\
+             3\n00:00:16,000 --> 00:00:17,000\n  >> 接下来保留 x > 2。\n",
+        );
+        assert_eq!(cues.len(), 3);
+        assert_eq!(cues[0].text, "Sorry. Ask what?");
+        assert_eq!(cues[0].raw.as_deref(), Some(">> Sorry. Ask what?"));
+        assert_eq!(cues[1].text, "Uh you might want to ask the people to chat.");
+        assert_eq!(cues[2].text, "接下来保留 x > 2。");
+        assert_eq!((cues[0].start, cues[0].end), (12.0, 13.599));
+        let cached = parse_subtitle(&to_srt(&cues));
+        assert_eq!(cached[0].text, cues[0].text);
+        assert_eq!(cached[2].text, cues[2].text);
+    }
+
+    #[test]
+    fn caption_cleanup_preserves_shifts_prompts_and_encoded_literals() {
+        for (source, expected) in [
+            ("x >> 2", "x >> 2"),
+            (">> 2", ">> 2"),
+            (">>= 2", ">>= 2"),
+            (">>> print(x)", ">>> print(x)"),
+            ("std::cin >> value", "std::cin >> value"),
+            ("Vec<Vec<T>>", "Vec<Vec<T>>"),
+            (">>hello", ">>hello"),
+            ("&gt;&gt; literal text", ">> literal text"),
+            ("`>> quoted code`", "`>> quoted code`"),
+        ] {
+            let events = parse_subtitle(&format!("1\n00:00:01,000 --> 00:00:02,000\n{source}\n"));
+            assert_eq!(events[0].text, expected, "{source}");
+            assert!(events[0].raw.is_none(), "{source}");
+        }
+    }
+
+    #[test]
+    fn standalone_speaker_marker_does_not_create_an_empty_spoken_event() {
+        let events = parse_subtitle(
+            "1\n00:00:01,000 --> 00:00:02,000\n>>\n\n2\n00:00:03,000 --> 00:00:04,000\n>>\nHello.\n",
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].text, "Hello.");
+        assert_eq!(events[0].raw.as_deref(), Some(">> Hello."));
+        assert_eq!(events[0].start, 3.0);
+    }
+
+    #[test]
+    fn normalization_does_not_merge_differently_marked_speaker_turns() {
+        let events = parse_subtitle(
+            "1\n00:00:01,000 --> 00:00:02,000\nHello.\n\n2\n00:00:02,000 --> 00:00:03,000\n>> Hello.\n",
+        );
+        assert_eq!(events.len(), 2);
+        assert!(events[0].raw.is_none());
+        assert_eq!(events[1].raw.as_deref(), Some(">> Hello."));
     }
 
     #[test]

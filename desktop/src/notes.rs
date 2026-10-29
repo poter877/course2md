@@ -354,6 +354,8 @@ struct AlignmentReport {
 
 #[derive(serde::Deserialize)]
 struct AlignmentPage {
+    #[serde(default)]
+    page: Option<usize>,
     t: f64,
     image: String,
     uncertain: bool,
@@ -409,7 +411,9 @@ fn read_page_reviews(
         let Some([block]) = matches.map(Vec::as_slice) else {
             anyhow::bail!("alignment does not match note sections");
         };
-        if page.uncertain {
+        // Older reports marked every unmatched video frame as uncertain.
+        // A screenshot fallback is a normal result, including in existing notes.
+        if page.uncertain && page.page.is_some() {
             reviews.insert(
                 *block,
                 PageReview {
@@ -694,6 +698,29 @@ mod tests {
         }
         assert_eq!(preview.plain_text, initial.plain_text);
         assert_eq!(preview.markdown_text, initial.markdown_text);
+    }
+
+    #[test]
+    fn legacy_unmatched_video_frames_do_not_request_pdf_review() {
+        let root = tempfile::tempdir().unwrap();
+        let course = published_note(root.path(), 1, &[10., 20.], Default::default());
+        let initial = read_preview(course.clone()).unwrap();
+        let mut report = saved_alignment(&initial, &[0, 1]);
+        report["pages"][0]["page"] = serde_json::Value::Null;
+        std::fs::write(course.dir.join("alignment.json"), report.to_string()).unwrap();
+        let preview = read_preview(course.clone()).unwrap();
+        assert_eq!(preview.page_reviews.len(), 1);
+        assert_eq!(preview.page_reviews[0].seconds, 20.);
+        report["pages"][1]["page"] = serde_json::Value::Null;
+        std::fs::write(course.dir.join("alignment.json"), report.to_string()).unwrap();
+        let preview = read_preview(course).unwrap();
+        assert!(preview.page_reviews.is_empty());
+        assert!(preview.issues.is_empty());
+        assert_eq!(preview.markdown_text, initial.markdown_text);
+        assert_eq!(
+            preview.document.sections[0].image,
+            initial.document.sections[0].image
+        );
     }
 
     #[test]

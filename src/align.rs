@@ -133,7 +133,9 @@ pub fn align(
     for (i, span) in spans.iter_mut().enumerate() {
         control.check()?;
         let Some(page) = span.page else {
-            span.uncertain = true;
+            // A retained video frame is the intended result for demonstrations
+            // and other content outside the PDF, not a match needing review.
+            span.uncertain = false;
             continue;
         };
         let (score, keywords) = index.score(page, span.t, ends[i], true);
@@ -697,7 +699,7 @@ mod tests {
             assert_eq!(section.speech[0].text, word);
         }
         assert_eq!(sections[3].end, 8.0);
-        assert!(spans[1..4].iter().all(|span| span.uncertain));
+        assert!(spans[1..4].iter().all(|span| !span.uncertain));
     }
 
     #[test]
@@ -764,7 +766,7 @@ mod tests {
         );
         assert_eq!(spans[1].image, frames[1].image);
         assert_eq!(spans[1].t, 2.0);
-        assert!(spans[1].uncertain);
+        assert!(!spans[1].uncertain);
         assert_eq!(spans[2].t, 3.0);
     }
 
@@ -1044,7 +1046,7 @@ mod tests {
                 spans[0].visual
             );
             assert_eq!(spans[0].image, image);
-            assert!(spans[0].uncertain);
+            assert!(!spans[0].uncertain);
             // The same title with a recording color cast remains a good match.
             let correct = title_image(title, 255, true);
             let score = ContentImage::new(&recorded).similarity(&ContentImage::new(&correct));
@@ -1108,7 +1110,7 @@ mod tests {
     }
 
     #[test]
-    fn unmatched_candidate_with_small_margin_is_always_uncertain() {
+    fn unmatched_candidate_with_small_margin_keeps_video_without_review() {
         let dir = tempfile::tempdir().unwrap();
         let gray = title_image("SERIES", 255, true);
         gray.save(dir.path().join("recorded.png")).unwrap();
@@ -1130,8 +1132,8 @@ mod tests {
         assert!(spans[0].visual > 0.99);
         assert_eq!(spans[0].page, None);
         assert!(
-            spans[0].uncertain,
-            "ambiguous high score is still unverified"
+            !spans[0].uncertain,
+            "no PDF match is claimed for a video frame"
         );
     }
 

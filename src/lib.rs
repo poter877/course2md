@@ -32,6 +32,8 @@ pub mod runtime;
 pub mod scene;
 pub mod settings;
 pub mod slides;
+pub mod study;
+pub mod study_ai;
 pub mod subtitle;
 pub mod summarize;
 #[cfg(test)]

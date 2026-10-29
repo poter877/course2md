@@ -2280,3 +2280,18 @@ PDF 页面的核对信息暂时无法读取，笔记正文仍可阅读。	PDF �
 外部幻灯片 PDF：可靠匹配使用 PDF 页，其余保留视频截图（可重复，按顺序编号 deck）	外部幻灯片 PDF：可靠匹配使用 PDF 页，其余保留视频截图（可重复，按顺序编号 deck）	Slide PDF: use reliably matched pages, otherwise keep video screenshots (repeatable; decks follow input order)	外部投影片 PDF：可靠匹配使用 PDF 頁，其餘保留影片截圖（可重複，依順序編號 deck）	スライド PDF：確実に一致するページを使い、それ以外は動画の画像を残す（複数指定可、指定順に資料番号を付与）
 外部字幕文件（SRT/VTT），优先于平台字幕与同名旁挂字幕	外部字幕文件（SRT/VTT），优先于平台字幕与同名旁挂字幕	Subtitle file (SRT/VTT), preferred over platform subtitles and same-name sidecar files	外部字幕檔案（SRT/VTT），優先於平台字幕與同名附加字幕	字幕ファイル（SRT/VTT）。配信元の字幕や同名の字幕ファイルより優先
 PDF 匹配结果的视觉复核阈值 (0,1]，默认 0.35	PDF 匹配结果的视觉复核阈值 (0,1]，默认 0.35	Visual review threshold for PDF matches (0,1], default 0.35	PDF 匹配結果的視覺複核閾值 (0,1]，預設 0.35	PDF ページの一致を確認する視覚スコアのしきい値 (0,1]、既定値 0.35
+请先在原文中选择文字	请先在原文中选择文字	Select text in the original first	請先在原文中選取文字	先に原文のテキストを選択してください
+所选原文已失效，请重新选择	所选原文已失效，请重新选择	The source selection is no longer valid. Select it again.	所選原文已失效，請重新選取	原文の選択が無効になりました。選択し直してください
+问题和回答不能为空	问题和回答不能为空	The question and answer cannot be empty	問題和回答不能為空	質問と回答を入力してください
+学习笔记记录无效，原文件已保留	学习笔记记录无效，原文件已保留	The learning note is invalid. The existing file was kept.	學習筆記記錄無效，原檔案已保留	学習ノートが無効です。既存のファイルは保持されています
+学习笔记记录过大，原文件已保留	学习笔记记录过大，原文件已保留	The learning note is too large. The existing file was kept.	學習筆記記錄過大，原檔案已保留	学習ノートが大きすぎます。既存のファイルは保持されています
+学习笔记已变化，请重新打开后再试	学习笔记已变化，请重新打开后再试	The learning note has changed. Reopen it and try again.	學習筆記已變更，請重新開啟後再試	学習ノートが変更されました。開き直して再試行してください
+学习笔记版本无效	学习笔记版本无效	Invalid learning note revision	學習筆記版本無效	学習ノートのリビジョンが無効です
+学习笔记尚未保存，请重试	学习笔记尚未保存，请重试	The learning note has not been saved. Try again.	學習筆記尚未儲存，請重試	学習ノートは保存されていません。再試行してください
+学习请求过大，请缩小选区后重试	学习请求过大，请缩小选区后重试	The learning request is too large. Select less text and try again.	學習請求過大，請縮小選取範圍後重試	学習リクエストが大きすぎます。選択範囲を小さくして再試行してください
+整理学习笔记	整理学习笔记	Organize learning notes	整理學習筆記	学習ノートを整理
+原文划线问答	原文划线问答	Ask about selected source text	原文劃線問答	選択した原文について質問
+分层学习摘要	分层学习摘要	Layered learning summary	分層學習摘要	階層的な学習要約
+待核对：{}	待核对：{}	Needs review: {}	待核對：{}	要確認：{}
+整理结果可能改变数字、条件、代码或公式，已保留原文，请核对。	整理结果可能改变数字、条件、代码或公式，已保留原文，请核对。	The organized result may change numbers, conditions, code, or formulas. The original has been kept for review.	整理結果可能變更數字、條件、程式碼或公式，已保留原文，請核對	整理結果で数値、条件、コード、数式が変わる可能性があります。原文を保持しました。確認してください
+整理结果的内容覆盖尚未确认，已保留原文，请核对。	整理结果的内容覆盖尚未确认，已保留原文，请核对。	Content coverage could not be confirmed. The original has been kept for review.	整理結果的內容涵蓋尚未確認，已保留原文，請核對。	整理結果に内容が網羅されているか確認できません。原文を保持しました。確認してください。

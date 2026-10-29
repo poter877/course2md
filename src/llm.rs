@@ -110,6 +110,9 @@ pub(crate) enum Purpose {
     Proofreading,
     Summary,
     Translation,
+    StudyOrganize,
+    StudyQuestion,
+    StudySummary,
 }
 
 impl Purpose {
@@ -118,6 +121,9 @@ impl Purpose {
             Self::Proofreading => "proofreading",
             Self::Summary => "summary",
             Self::Translation => "translation",
+            Self::StudyOrganize => "study-organize",
+            Self::StudyQuestion => "study-question",
+            Self::StudySummary => "study-summary",
         }
     }
     fn usage_stage(self) -> Stage {
@@ -125,6 +131,8 @@ impl Purpose {
             Self::Proofreading => Stage::Llm,
             Self::Summary => Stage::Summary,
             Self::Translation => Stage::Translate,
+            Self::StudyOrganize | Self::StudyQuestion => Stage::Llm,
+            Self::StudySummary => Stage::Summary,
         }
     }
 }

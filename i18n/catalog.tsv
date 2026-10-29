@@ -2207,12 +2207,12 @@ Intel NPU 不再支持 Qwen3 模型。可用：{}	Intel NPU 不再支持 Qwen3 �
 启用 AI 处理	启用 AI 处理	Enable AI processing	啟用 AI 處理	AI 処理を有効にする
 视频画面（无对应幻灯片）	视频画面（无对应幻灯片）	Video screen (no matching slide)	影片畫面（無對應投影片）	映像画面（対応スライドなし）
 AI 翻译整篇	AI 翻译整篇	Translate whole note with AI	AI 翻譯整篇	AI でノート全体を翻訳
-撤销这次 AI 翻译	撤销这次 AI 翻译	Undo this AI translation	撤銷這次 AI 翻譯	この AI 翻訳を元に戻す
+撤销这次 AI 编辑	撤销这次 AI 编辑	Undo this AI edit	撤銷這次 AI 編輯	この AI 編集を元に戻す
 正在翻译整篇笔记…	正在翻译整篇笔记…	Translating the whole note…	正在翻譯整篇筆記…	ノート全体を翻訳しています…
 已翻译 {}/{} 段	已翻译 {}/{} 段	Translated {}/{} passages	已翻譯 {}/{} 段	{}/{} 段落を翻訳しました
 翻译时意外中断，请重试	翻译时意外中断，请重试	Translation was interrupted; try again	翻譯時意外中斷，請重試	翻訳が中断されました。再試行してください
 撤销时意外中断，请重试	撤销时意外中断，请重试	Undo was interrupted; try again	撤銷時意外中斷，請重試	元に戻す処理が中断されました。再試行してください
-已撤销这次 AI 翻译	已撤销这次 AI 翻译	AI translation undone	已撤銷這次 AI 翻譯	この AI 翻訳を元に戻しました
+已撤销这次 AI 编辑	已撤销这次 AI 编辑	AI edit undone	已撤銷這次 AI 編輯	この AI 編集を元に戻しました
 这份笔记没有可撤销的 AI 编辑 / No AI edit to undo	这份笔记没有可撤销的 AI 编辑 / No AI edit to undo	This note has no AI edit to undo	這份筆記沒有可撤銷的 AI 編輯 / No AI edit to undo	このノートには元に戻せる AI 編集がありません
 AI 处理本段	AI 处理本段	AI edit this paragraph	AI 處理本段	この段落を AI 編集
 AI 清理语气词	AI 清理语气词	Remove filler words	AI 清理語氣詞	フィラーを削除
@@ -2327,3 +2327,18 @@ AI补充	AI补充	AI addition	AI 補充	AIによる補足
 查看预览	查看预览	View preview	查看預覽	プレビューを表示
 重新加载学习笔记	重新加载学习笔记	Reload learning notes	重新載入學習筆記	学習ノートを再読み込み
 放弃预览并重新加载	放弃预览并重新加载	Discard preview and reload	捨棄預覽並重新載入	プレビューを破棄して再読み込み
+AI 清理选中文字	AI 清理选中文字	AI clean up selection	AI 清理選取文字	AI で選択範囲を整理
+AI 优化选中文字	AI 优化选中文字	AI improve selection	AI 優化選取文字	AI で選択範囲を推敲
+正在处理选中文字…	正在处理选中文字…	Processing selected text…	正在處理選取文字…	選択した文章を処理中…
+已更新选中文字	已更新选中文字	Selected text updated	已更新選取文字	選択範囲を更新しました
+AI 处理选中文字	AI 处理选中文字	AI edit selection	AI 處理選取文字	AI で選択範囲を編集
+选中的原文	选中的原文	Selected source text	選取的原文	選択した原文
+附带截图（可选，最多 4 张）	附带截图（可选，最多 4 张）	Attach screenshots (optional, up to 4)	附帶截圖（選填，最多 4 張）	スクリーンショットを添付（任意、最大4枚）
+已选择 {} / 4 张	已选择 {} / 4 张	Selected {} / 4 screenshots	已選取 {} / 4 張	{} / 4 枚選択中
+附加要求（可选）	附加要求（可选）	Additional instructions (optional)	附加要求（選填）	追加の指示（任意）
+所选截图无法读取，请取消选择后重试	所选截图无法读取，请取消选择后重试	A selected screenshot could not be read. Deselect it and try again.	所選截圖無法讀取，請取消選取後重試	選択した画像を読み込めません。選択を解除して再試行してください。
+开始后将把选中文字、所选截图和附加要求发送给 AI。	开始后将把选中文字、所选截图和附加要求发送给 AI。	Starting sends the selected text, screenshots, and additional instructions to AI.	開始後將把選取文字、所選截圖和附加要求傳送給 AI。	開始すると、選択した文章と画像、追加の指示が AI に送信されます。
+上一页	上一页	Previous page	上一頁	前のページ
+下一页	下一页	Next page	下一頁	次のページ
+复制	复制	Copy	複製	コピー
+开始	开始	Start	開始	開始

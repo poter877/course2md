@@ -266,6 +266,48 @@ impl Desktop {
         cx.notify();
     }
 
+    pub(crate) fn ask_study_from_reader(
+        &mut self,
+        spans: Vec<SourceSpan>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.page != Page::Result || self.reading {
+            return;
+        }
+        let Some(preview) = self.preview.as_ref() else {
+            return;
+        };
+        let snapshot = match StudyNote::from_document(preview.document.clone()) {
+            Ok(note) if note.quote(&spans).is_ok() => note,
+            _ => {
+                self.message = Some(course2md::tr!("笔记已发生变化，请重新选择文字后再试").into());
+                cx.notify();
+                return;
+            }
+        };
+        self.open_study(window, cx);
+        if self
+            .study_ui
+            .note
+            .as_ref()
+            .is_some_and(|note| note.source_digest != snapshot.source_digest)
+        {
+            self.study_ui
+                .show_error(course2md::tr!("笔记已发生变化，请重新选择文字后再试"));
+            cx.notify();
+            return;
+        }
+        self.study_ui.question_spans = spans;
+        self.study_ui.question_origin = Some(snapshot.source_digest);
+        self.study_ui.question_expanded = true;
+        self.study_ui.controls_scroll.scroll_to_bottom();
+        self.study_ui
+            .question
+            .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
     fn load_study(&mut self, cx: &mut Context<Self>) {
         if self.study_ui.pending.is_some() || self.study_ui.candidate.is_some() {
             return;
@@ -315,6 +357,11 @@ impl Desktop {
                             &this.study_ui.question_spans,
                             &note,
                         ) {
+                            if !this.study_ui.question_spans.is_empty() {
+                                this.study_ui.show_error(course2md::tr!(
+                                    "笔记已发生变化，请重新选择文字后再试"
+                                ));
+                            }
                             this.study_ui.question_spans.clear();
                             this.study_ui.question_origin = None;
                         }

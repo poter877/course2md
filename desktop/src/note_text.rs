@@ -142,6 +142,18 @@ impl NoteText {
     /// elements, so selecting ordinary text in another column cannot supply source.
     /// Use distinct stable element IDs for notes/versions/columns and clear the
     /// caller's aggregate when navigating. Callbacks run outside layout/paint.
+    ///
+    /// For a source-column `context_menu`, clone the aggregate in its menu builder
+    /// (or freeze it on the row's right mouse-down, then clone that frozen value in
+    /// the deferred builder) and move that owned snapshot into each action.
+    /// Always overwrite a frozen value, even when empty. Right mouse-down and menu
+    /// focus preserve selection; left mouse-down on a menu item can report `None`
+    /// before the action runs. Keep processing those live clears, without changing
+    /// the action's snapshot or falling back to a previous nonempty selection.
+    /// Capture the note/version identity with the snapshot and validate it at
+    /// execution. Scope the menu to the source column: a right click elsewhere
+    /// does not clear a still-valid source selection. See `selection_tests` for
+    /// an exercised GPUI menu builder and mouse-click implementation.
     pub fn on_selection(
         mut self,
         callback: impl Fn(Option<Range<usize>>, &mut Window, &mut App) + 'static,
@@ -1441,7 +1453,10 @@ impl Element for NoteText {
         if state.blocks.len() > 1 {
             let shared = state.shared.clone();
             window.on_mouse_event(move |event: &MouseDownEvent, phase, window, _| {
-                if phase.bubble() && event.click_count >= 3 {
+                if phase.bubble()
+                    && event.button == gpui::MouseButton::Left
+                    && event.click_count >= 3
+                {
                     let mut shared = shared.borrow_mut();
                     if let Some(range) = shared.paragraph_at(event.position) {
                         shared.paragraph = Paragraph::Armed(range);
@@ -1971,9 +1986,11 @@ mod selection_tests {
     use super::*;
     use gpui::{Context, MouseButton, Render, TestAppContext, VisualTestContext, point};
     use gpui_base::{TextSelection, TextSelectionLayer};
+    use gpui_component::menu::{ContextMenuExt, PopupMenuItem};
 
     type Observed = Rc<RefCell<HashMap<usize, Range<usize>>>>;
     type SelectionEvents = Rc<RefCell<Vec<(usize, Option<Range<usize>>)>>>;
+    type MenuSnapshots = Rc<RefCell<Vec<HashMap<usize, Range<usize>>>>>;
 
     struct Harness {
         sources: [SharedString; 2],
@@ -1981,6 +1998,9 @@ mod selection_tests {
         width: f32,
         observed: Observed,
         events: SelectionEvents,
+        frozen: Observed,
+        menus: MenuSnapshots,
+        confirmed: MenuSnapshots,
     }
 
     impl Render for Harness {
@@ -1992,19 +2012,50 @@ mod selection_tests {
                 .map(|(index, source)| {
                     let observed = self.observed.clone();
                     let events = self.events.clone();
-                    div().w(px(self.width)).child(
-                        NoteText::new(("original", index), source.clone())
-                            .document_order(index as u64)
-                            .copy(Copy::Labeled("Label: ".into()))
-                            .on_selection(move |range, _, _| {
-                                events.borrow_mut().push((index, range.clone()));
-                                if let Some(range) = range {
-                                    observed.borrow_mut().insert(index, range);
-                                } else {
-                                    observed.borrow_mut().remove(&index);
-                                }
-                            }),
-                    )
+                    let live = self.observed.clone();
+                    let frozen = self.frozen.clone();
+                    let pressed = frozen.clone();
+                    let menus = self.menus.clone();
+                    let confirmed = self.confirmed.clone();
+                    div()
+                        .id(("source-row", index))
+                        .w(px(self.width))
+                        .child(
+                            NoteText::new(("original", index), source.clone())
+                                .document_order(index as u64)
+                                .copy(Copy::Labeled("Label: ".into()))
+                                .on_selection(move |range, _, _| {
+                                    events.borrow_mut().push((index, range.clone()));
+                                    if let Some(range) = range {
+                                        observed.borrow_mut().insert(index, range);
+                                    } else {
+                                        observed.borrow_mut().remove(&index);
+                                    }
+                                }),
+                        )
+                        .on_mouse_down(MouseButton::Right, move |_, _, _| {
+                            // Right capture preserves selection. Always replace the
+                            // previous snapshot, including when the selection is empty.
+                            *pressed.borrow_mut() = live.borrow().clone();
+                        })
+                        .context_menu(move |menu, _, _| {
+                            // The component builds the menu later. Each action owns
+                            // its snapshot rather than reading this mutable cell again.
+                            let snapshot = frozen.borrow().clone();
+                            menus.borrow_mut().push(snapshot.clone());
+                            let confirmed = confirmed.clone();
+                            menu.item(
+                                PopupMenuItem::element(|_, _| {
+                                    div()
+                                        .debug_selector(|| "selection-menu-action".into())
+                                        .child("Use selection")
+                                })
+                                .disabled(snapshot.is_empty())
+                                .on_click(move |_, _, _| {
+                                    confirmed.borrow_mut().push(snapshot.clone());
+                                }),
+                            )
+                        })
                 })
                 .collect::<Vec<_>>();
             div()
@@ -2015,6 +2066,7 @@ mod selection_tests {
                 .when(self.visible, |view| {
                     view.child(
                         div()
+                            .id("source-column")
                             .flex()
                             .flex_col()
                             .gap_4()
@@ -2031,6 +2083,7 @@ mod selection_tests {
     }
 
     fn harness(cx: &mut TestAppContext) -> (gpui::Entity<Harness>, &mut VisualTestContext) {
+        cx.update(gpui_component::init);
         cx.add_window_view(|_, _| Harness {
             sources: [
                 "甲🙂 alpha beta gamma delta".into(),
@@ -2040,6 +2093,9 @@ mod selection_tests {
             width: 250.,
             observed: Default::default(),
             events: Default::default(),
+            frozen: Default::default(),
+            menus: Default::default(),
+            confirmed: Default::default(),
         })
     }
 
@@ -2077,6 +2133,109 @@ mod selection_tests {
         cx.simulate_mouse_move(end, Some(MouseButton::Left), Default::default());
         cx.simulate_mouse_up(end, MouseButton::Left, Default::default());
         draw(cx);
+    }
+
+    fn open_menu(cx: &mut VisualTestContext, at: Point<Pixels>) {
+        cx.simulate_mouse_down(at, MouseButton::Right, Default::default());
+        cx.simulate_mouse_up(at, MouseButton::Right, Default::default());
+        cx.run_until_parked();
+        draw(cx);
+    }
+
+    #[gpui::test]
+    fn right_click_menu_preserves_utf8_formula_selection_and_freezes_action(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = harness(cx);
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                view.sources[0] = "甲🙂 前文 $x+1$ 后文\n$$y^2$$\n末尾".into();
+                cx.notify();
+            });
+        });
+        draw(cx);
+        let (sources, observed, events, menus, confirmed) = cx.update(|_, cx| {
+            let state = view.read(cx);
+            (
+                state.sources.clone(),
+                state.observed.clone(),
+                state.events.clone(),
+                state.menus.clone(),
+                state.confirmed.clone(),
+            )
+        });
+        let start = position(&sources[0], "甲".len());
+        let end = position(&sources[1], "第二段 epsilon".len());
+        drag(cx, start, end);
+        let expected = HashMap::from([
+            (0, "甲".len()..sources[0].len()),
+            (1, 0.."第二段 epsilon".len()),
+        ]);
+        assert_eq!(*observed.borrow(), expected);
+        events.borrow_mut().clear();
+        open_menu(cx, start);
+        assert_eq!(*menus.borrow(), vec![expected.clone()]);
+        assert_eq!(*observed.borrow(), expected);
+        assert!(events.borrow().is_empty(), "opening a menu must not clear");
+        let action = cx.debug_bounds("selection-menu-action").unwrap().center();
+        cx.simulate_mouse_down(action, MouseButton::Left, Default::default());
+        draw(cx);
+        assert!(observed.borrow().is_empty(), "live clears must still run");
+        assert!(confirmed.borrow().is_empty(), "mouse-down is not a submit");
+        cx.simulate_mouse_up(action, MouseButton::Left, Default::default());
+        draw(cx);
+        assert_eq!(*confirmed.borrow(), vec![expected]);
+        assert_eq!(
+            &sources[0][confirmed.borrow()[0][&0].clone()],
+            "🙂 前文 $x+1$ 后文\n$$y^2$$\n末尾"
+        );
+        // The next menu gets the current empty selection, never the old quote.
+        open_menu(cx, start);
+        assert!(menus.borrow().last().unwrap().is_empty());
+        let action = cx.debug_bounds("selection-menu-action").unwrap().center();
+        cx.simulate_mouse_down(action, MouseButton::Left, Default::default());
+        cx.simulate_mouse_up(action, MouseButton::Left, Default::default());
+        draw(cx);
+        assert_eq!(confirmed.borrow().len(), 1);
+    }
+
+    #[gpui::test]
+    fn source_menu_does_not_capture_right_column_or_mixed_column_selection(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, cx) = harness(cx);
+        draw(cx);
+        let (sources, observed, menus, confirmed) = cx.update(|_, cx| {
+            let state = view.read(cx);
+            (
+                state.sources.clone(),
+                state.observed.clone(),
+                state.menus.clone(),
+                state.confirmed.clone(),
+            )
+        });
+        let start = position(&sources[0], "甲🙂 ".len());
+        let end = position(&sources[0], "甲🙂 alpha".len());
+        drag(cx, start, end);
+        assert!(!observed.borrow().is_empty());
+        open_menu(cx, point(px(400.), px(10.)));
+        assert!(menus.borrow().is_empty(), "source menu is column-scoped");
+        assert!(confirmed.borrow().is_empty());
+        // Both a right-column-only selection and a gesture crossing columns
+        // must leave the source menu empty, even after a valid source selection.
+        for from in [point(px(360.), px(10.)), start] {
+            drag(cx, from, point(px(450.), px(10.)));
+            assert!(observed.borrow().is_empty());
+            open_menu(cx, start);
+            assert!(menus.borrow().last().unwrap().is_empty());
+            let action = cx.debug_bounds("selection-menu-action").unwrap().center();
+            cx.simulate_mouse_down(action, MouseButton::Left, Default::default());
+            cx.simulate_mouse_up(action, MouseButton::Left, Default::default());
+            draw(cx);
+            assert!(confirmed.borrow().is_empty());
+            cx.simulate_keystrokes("escape");
+            draw(cx);
+        }
     }
 
     #[gpui::test]
@@ -2227,6 +2386,27 @@ mod selection_tests {
                 })
                 .expect("display formula has a selectable source segment")
         });
+        drag(cx, start, end);
+        let range = observed.borrow().get(&0).cloned().unwrap();
+        assert_eq!(&source[range], "$$y^2$$");
+        // Multiple right clicks must not arm the left-button paragraph override
+        // and contaminate the next drag after the context menu is dismissed.
+        cx.simulate_event(MouseDownEvent {
+            position: start,
+            button: MouseButton::Right,
+            click_count: 3,
+            modifiers: Default::default(),
+            first_mouse: false,
+        });
+        cx.simulate_event(gpui::MouseUpEvent {
+            position: start,
+            button: MouseButton::Right,
+            click_count: 3,
+            modifiers: Default::default(),
+        });
+        draw(cx);
+        cx.simulate_keystrokes("escape");
+        draw(cx);
         drag(cx, start, end);
         let range = observed.borrow().get(&0).cloned().unwrap();
         assert_eq!(&source[range], "$$y^2$$");

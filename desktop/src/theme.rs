@@ -148,14 +148,12 @@ pub fn color(token: ColorToken) -> Rgba {
     PAINT.with(|paint| paint.borrow().current[token as usize])
 }
 
-pub fn system_dark(cx: &App) -> bool {
-    ThemeMode::from(cx.window_appearance()).is_dark()
-}
-
 /// Resolve system changes on each notified frame, and retarget palette changes
 /// from their current paint values. Persisted settings are the sole authority.
 pub fn apply_preference(preference: &ThemePreferences, window: &mut Window, cx: &mut App) {
-    let id = preference.resolve(system_dark(cx));
+    // The window caches appearance updates. Querying the platform again while
+    // an X11 appearance callback is drawing can reborrow its client and panic.
+    let id = preference.resolve(ThemeMode::from(window.appearance()).is_dark());
     let target = palette_colors(id);
     let (changed, running) = PAINT.with(|paint| {
         let mut paint = paint.borrow_mut();

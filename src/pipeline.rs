@@ -257,7 +257,11 @@ async fn run_task_inner(
         .await;
     }
     let subtitle = if let Some(events) = &request.subtitle_events {
-        Some(events.clone())
+        let mut events = events.clone();
+        if request.subtitle_normalization_version == 0 {
+            crate::subtitle::normalize_legacy_events(&mut events);
+        }
+        Some(events)
     } else if let Some(path) = &request.subtitle {
         let content = crate::subtitle::read_subtitle_text(path).context(crate::tr!(
             "无法读取已选字幕 / Cannot read selected subtitles"
@@ -862,6 +866,8 @@ enum TranscriptOrigin {
 
 #[derive(Serialize, Deserialize)]
 struct TranscriptCache {
+    #[serde(default)]
+    normalization_version: u32,
     source: TranscriptOrigin,
     events: Vec<timeline::TranscriptEvent>,
 }
@@ -1270,7 +1276,11 @@ async fn transcript(
         return Ok(cache);
     }
     let cache_path = job.dir.join("transcript.json");
-    let cache = match selected.map(|(events, source)| TranscriptCache { source, events }) {
+    let cache = match selected.map(|(events, source)| TranscriptCache {
+        normalization_version: crate::subtitle::NORMALIZATION_VERSION,
+        source,
+        events,
+    }) {
         Some(cache) => cache,
         None => {
             progress::start(Stage::Audio);
@@ -1291,6 +1301,7 @@ async fn transcript(
             let events = asr::run(cfg, &audio, job).await?;
             progress::done(Stage::Transcribe);
             TranscriptCache {
+                normalization_version: crate::subtitle::NORMALIZATION_VERSION,
                 source: TranscriptOrigin::Asr,
                 events,
             }
@@ -1522,9 +1533,13 @@ fn cached_transcript(cache_path: &Path) -> Result<Option<TranscriptCache>> {
     if !cache_path.is_file() {
         return Ok(None);
     }
-    let cache: TranscriptCache = serde_json::from_slice(&std::fs::read(cache_path)?).context(
+    let mut cache: TranscriptCache = serde_json::from_slice(&std::fs::read(cache_path)?).context(
         crate::tr!("已保存的文字损坏，原文件已保留 / Saved transcript is damaged"),
     )?;
+    if cache.source != TranscriptOrigin::Asr && cache.normalization_version == 0 {
+        crate::subtitle::normalize_legacy_events(&mut cache.events);
+        cache.normalization_version = crate::subtitle::NORMALIZATION_VERSION;
+    }
     if crate::timeline::has_readable_events(&cache.events) {
         execution::validate_events(&cache.events)?;
         return Ok(Some(cache));
@@ -2100,6 +2115,7 @@ mod tests {
 
         // 全空缓存（上次端点故障的残留）→ 丢弃并删除文件，ASR 得以重跑
         let empty = super::TranscriptCache {
+            normalization_version: 0,
             source: super::TranscriptOrigin::Asr,
             events: vec![ev(""), ev("  ")],
         };
@@ -2109,6 +2125,7 @@ mod tests {
 
         // 有可读文字的缓存 → 正常复用
         let good = super::TranscriptCache {
+            normalization_version: 0,
             source: super::TranscriptOrigin::Asr,
             events: vec![ev("你好")],
         };
@@ -2123,6 +2140,33 @@ mod tests {
         // 不存在的缓存 → None
         let missing = dir.path().join("missing.json");
         assert!(super::cached_transcript(&missing).unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_upgrade_is_subtitle_only_and_keeps_source_and_timing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("transcript.json");
+        for (source, revision, expected) in [
+            ("asr", 0, ">> Hello."),
+            ("selected-subtitle", 0, "Hello."),
+            ("auto-caption", 0, "Hello."),
+            ("subtitle", 0, "Hello."),
+            ("selected-subtitle", 1, ">> Hello."),
+        ] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "source":source, "normalization_version":revision,
+                "events":[{"start":1.25,"end":2.5,"text":">> Hello."}]
+            }))
+            .unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            let cache = super::cached_transcript(&path).unwrap().unwrap();
+            assert_eq!(cache.events[0].text, expected);
+            assert_eq!((cache.events[0].start, cache.events[0].end), (1.25, 2.5));
+            if expected == "Hello." {
+                assert_eq!(cache.events[0].raw.as_deref(), Some(">> Hello."));
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
     }
 
     #[test]

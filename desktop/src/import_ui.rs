@@ -5119,6 +5119,7 @@ mod tests {
         };
         assert!(subtitle_needs_confirmation(&source, TranscriptSource::Auto));
         source.selected_subtitle = Some(CachedSubtitle {
+            normalization_version: course2md::subtitle::NORMALIZATION_VERSION,
             source_identity: source.identity.clone(),
             track_id: track.id.clone(),
             label: "已读取字幕".into(),

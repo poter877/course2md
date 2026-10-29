@@ -559,6 +559,7 @@ fn summarize_note(
         author: document.meta.uploader.clone(),
         duration: document.meta.duration.max(0.),
         subtitle: None,
+        subtitle_normalization_version: 0,
         subtitle_events: None,
         slides: Vec::new(),
         config: file.clone(),

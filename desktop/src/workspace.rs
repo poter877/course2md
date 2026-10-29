@@ -2909,6 +2909,7 @@ mod tests {
         let mut task = plan(&ws.state.default_library);
         task.source.identity = "video-a".into();
         task.source.selected_subtitle = Some(course2md::subtitle::CachedSubtitle {
+            normalization_version: course2md::subtitle::NORMALIZATION_VERSION,
             source_identity: "video-a".into(),
             track_id: "zh".into(),
             label: "中文".into(),

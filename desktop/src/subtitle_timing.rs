@@ -232,6 +232,7 @@ mod tests {
 
     fn fixture() -> (TimingSource, Draft, Source) {
         let subtitle = CachedSubtitle {
+            normalization_version: course2md::subtitle::NORMALIZATION_VERSION,
             source_identity: "video-a".into(),
             track_id: "track-a".into(),
             label: "captions".into(),

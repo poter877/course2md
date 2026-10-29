@@ -78,6 +78,8 @@ pub struct Request {
     pub subtitle: Option<PathBuf>,
     #[serde(default)]
     pub subtitle_events: Option<Vec<TranscriptEvent>>,
+    #[serde(default)]
+    pub subtitle_normalization_version: u32,
     /// 幻灯片 PDF：视频只用于换页检测，成图与页码改用这些 PDF 页（按顺序编号）
     #[serde(default)]
     pub slides: Vec<PathBuf>,
@@ -314,6 +316,10 @@ impl Request {
         });
         if !slide_digests.is_empty() {
             binding["slide_digests"] = serde_json::json!(slide_digests);
+        }
+        // Keep pre-upgrade bindings byte-compatible for interrupted tasks.
+        if self.subtitle_events.is_some() && self.subtitle_normalization_version != 0 {
+            binding["subtitle_normalization_version"] = self.subtitle_normalization_version.into();
         }
         Ok(binding)
     }

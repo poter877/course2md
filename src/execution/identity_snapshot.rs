@@ -31,6 +31,7 @@ fn request(source: &str, source_id: &str, config: ConfigFile) -> execution::Requ
         author: "Teacher".into(),
         duration: 61.5,
         subtitle: None,
+        subtitle_normalization_version: 0,
         subtitle_events: None,
         slides: Vec::new(),
         config,

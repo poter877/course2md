@@ -1064,6 +1064,12 @@ impl Desktop {
             } else {
                 None
             },
+            subtitle_normalization_version: task
+                .plan
+                .source
+                .selected_subtitle
+                .as_ref()
+                .map_or(0, |subtitle| subtitle.normalization_version),
             subtitle_events: None,
             slides: task.plan.slides.clone(),
             config,

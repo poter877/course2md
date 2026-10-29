@@ -41,6 +41,7 @@ fn request(root: &Path, source: &Path) -> Request {
         duration: 1.,
         subtitle: None,
         slides: Vec::new(),
+        subtitle_normalization_version: 0,
         subtitle_events: Some(vec![TranscriptEvent {
             start: 0.,
             end: 1.,
@@ -595,6 +596,106 @@ fn scanning_finishes_before_a_slow_screenshot_reports_progress_with_estimated_to
             .any(|event| event["stage"] == "scenes/extract" && event["status"] == "done")
     );
     assert!(!observed.iter().any(|event| event["stage"] == "scenes"));
+}
+
+#[test]
+fn legacy_desktop_subtitles_and_resumed_cache_keep_speaker_paragraphs() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    for cached in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let video = root.path().join("lecture.mp4");
+        common::fixture_video(&video, 1);
+        let mut request = request(root.path(), &video);
+        let speech: Vec<_> = [
+            "Check folks",
+            "online.",
+            ">> Sorry. Ask what?",
+            ">> Uh please",
+            "chat.",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| TranscriptEvent {
+            start: i as f64 / 5.,
+            end: (i + 1) as f64 / 5.,
+            text: text.into(),
+            raw: None,
+            translation: None,
+        })
+        .collect();
+        request.subtitle_events = Some(speech.clone());
+        request.config.defaults.model_dir = Some(root.path().join("models"));
+        request.config.defaults.formats = Some(vec![course2md::config::OutputFormat::Html]);
+        let cache = request.work_dir.join("transcript.json");
+        let original_cache =
+            serde_json::to_vec(&serde_json::json!({"source":"selected-subtitle","events":speech}))
+                .unwrap();
+        if cached {
+            let binding = request.binding(&request.resolve().unwrap()).unwrap();
+            course2md::execution::bind_work_dir(&request.work_dir, &binding).unwrap();
+            std::fs::write(&cache, &original_cache).unwrap();
+        }
+        let output = run(root.path(), &request);
+        assert!(output.status.success(), "{:?}", events(&output));
+        let version = request.course_dir.join("versions/version-one");
+        let doc: artifact::Document =
+            serde_json::from_slice(&std::fs::read(version.join("document.json")).unwrap()).unwrap();
+        let paragraphs = course2md::pipeline::all_speech(&doc.sections);
+        assert_eq!(
+            paragraphs
+                .iter()
+                .map(|p| p.text.as_str())
+                .collect::<Vec<_>>(),
+            ["Check folks online.", "Sorry. Ask what?", "Uh please chat."]
+        );
+        assert_eq!(paragraphs[1].start, 0.4);
+        assert!(
+            std::fs::read_to_string(version.join("course.md"))
+                .unwrap()
+                .contains("\n\nSorry. Ask what?\n\n")
+        );
+        assert!(
+            std::fs::read_to_string(version.join("exports/course.html"))
+                .unwrap()
+                .contains("<p>Sorry. Ask what?</p>")
+        );
+        if cached {
+            assert_eq!(
+                std::fs::read(cache).unwrap(),
+                original_cache,
+                "migration is read-only"
+            );
+        }
+    }
+}
+
+#[test]
+fn current_desktop_literal_markers_are_not_legacy_speaker_turns() {
+    if !common::ffmpeg_available() {
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let video = root.path().join("lecture.mp4");
+    common::fixture_video(&video, 1);
+    let mut request = request(root.path(), &video);
+    request.subtitle_normalization_version = course2md::subtitle::NORMALIZATION_VERSION;
+    request.subtitle_events = Some(course2md::subtitle::parse_subtitle(
+        "1\n00:00:00,000 --> 00:00:01,000\n&gt;&gt; literal code\n",
+    ));
+    let output = run(root.path(), &request);
+    assert!(output.status.success(), "{:?}", events(&output));
+    let doc: artifact::Document = serde_json::from_slice(
+        &std::fs::read(
+            request
+                .course_dir
+                .join("versions/version-one/document.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(doc.sections[0].speech[0].text, ">> literal code");
 }
 
 #[test]

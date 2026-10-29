@@ -1011,6 +1011,7 @@ pub fn read_subtitle(
         file.as_file().sync_all()?;
         check_cancel(&cancel)?;
         Ok(CachedSubtitle {
+            normalization_version: course2md::subtitle::NORMALIZATION_VERSION,
             source_identity: source.identity.clone(),
             track_id: track.id.clone(),
             label: track.label(),

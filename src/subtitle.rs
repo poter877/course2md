@@ -108,11 +108,33 @@ impl SubtitleEvidence {
 /// avoiding a later change to the attached file or an expired remote subtitle URL.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CachedSubtitle {
+    /// Zero identifies snapshots saved before speaker-turn normalization.
+    #[serde(default)]
+    pub normalization_version: u32,
     pub source_identity: String,
     pub track_id: String,
     pub label: String,
     pub path: PathBuf,
     pub events: Vec<TranscriptEvent>,
+}
+
+pub const NORMALIZATION_VERSION: u32 = 1;
+
+/// Upgrade frozen subtitle events from older desktops without rereading a
+/// potentially changed file. Only the old leading caption marker is removed;
+/// original text and timing remain available. Never apply this to ASR or to
+/// current parsed events (whose escaped literal `>>` must remain literal).
+pub fn normalize_legacy_events(events: &mut [TranscriptEvent]) {
+    for event in events {
+        if event.raw.is_some() {
+            continue;
+        }
+        let spoken = without_speaker_marker(&event.text);
+        if spoken != event.text.trim() {
+            let text = spoken.to_owned();
+            event.raw = Some(std::mem::replace(&mut event.text, text));
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

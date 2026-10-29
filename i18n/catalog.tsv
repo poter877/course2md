@@ -2294,4 +2294,36 @@ PDF 匹配结果的视觉复核阈值 (0,1]，默认 0.35	PDF 匹配结果的视
 分层学习摘要	分层学习摘要	Layered learning summary	分層學習摘要	階層的な学習要約
 待核对：{}	待核对：{}	Needs review: {}	待核對：{}	要確認：{}
 整理结果可能改变数字、条件、代码或公式，已保留原文，请核对。	整理结果可能改变数字、条件、代码或公式，已保留原文，请核对。	The organized result may change numbers, conditions, code, or formulas. The original has been kept for review.	整理結果可能變更數字、條件、程式碼或公式，已保留原文，請核對	整理結果で数値、条件、コード、数式が変わる可能性があります。原文を保持しました。確認してください
+加入整理稿	加入整理稿	Add to organized notes	加入整理稿	整理稿に追加
+原文	原文	Original	原文	原文
+原文保持不变，整理结果确认后单独保存。	原文保持不变，整理结果确认后单独保存。	The original stays unchanged. Confirm organized results to save them separately.	原文保持不變，整理結果確認後另行儲存。	原文は変更されません。整理結果を確認すると別に保存されます。
+原文暂无摘要	原文暂无摘要	No original summary	原文暫無摘要	原文の要約はありません
+原有摘要	原有摘要	Original summary	原有摘要	元の要約
+在原文中划选文字，再输入问题。	在原文中划选文字，再输入问题。	Select text in the original, then enter your question.	在原文中劃選文字，再輸入問題。	原文のテキストを選択し、質問を入力してください。
+处理意外中断，请重试	处理意外中断，请重试	Processing was interrupted. Try again.	處理意外中斷，請重試	処理が中断されました。再試行してください
+学习摘要	学习摘要	Learning summary	學習摘要	学習要約
+学习笔记	学习笔记	Learning notes	學習筆記	学習ノート
+学习阅读视图	学习阅读视图	Learning view	學習閱讀檢視	学習表示
+对选中文字提问	对选中文字提问	Ask about selection	對選取文字提問	選択範囲について質問
+应用整理结果	应用整理结果	Apply results	套用整理結果	結果を適用
+提问	提问	Ask	提問	質問する
+放弃预览	放弃预览	Discard preview	捨棄預覽	プレビューを破棄
+整理全文	整理全文	Organize all	整理全文	全文を整理
+整理本节	整理本节	Organize section	整理本節	この節を整理
+整理稿	整理稿	Organized notes	整理稿	整理稿
+本节尚未整理	本节尚未整理	This section has not been organized	本節尚未整理	この節はまだ整理されていません
+根据原文与截图生成摘要，保留章节出处。	根据原文与截图生成摘要，保留章节出处。	Summarize the original and screenshots with links to source sections.	根據原文與截圖產生摘要，保留章節出處。	原文とスクリーンショットから要約し、出典の節を残します。
+正在整理章节 {}/{}	正在整理章节 {}/{}	Organizing section {}/{}	正在整理章節 {}/{}	節を整理中 {}/{}
+正在生成学习笔记…	正在生成学习笔记…	Generating learning notes…	正在產生學習筆記…	学習ノートを生成中…
+生成学习摘要	生成学习摘要	Generate summary	產生學習摘要	学習要約を生成
+请输入问题	请输入问题	Enter a question	請輸入問題	質問を入力してください
+输入问题	输入问题	Your question	輸入問題	質問を入力
+返回阅读	返回阅读	Back to reading	返回閱讀	閲覧に戻る
+预览尚未保存，确认后加入整理稿。	预览尚未保存，确认后加入整理稿。	This preview is not saved. Confirm to add it to your organized notes.	預覽尚未儲存，確認後加入整理稿。	プレビューは未保存です。確認すると整理稿に追加されます。
 整理结果的内容覆盖尚未确认，已保留原文，请核对。	整理结果的内容覆盖尚未确认，已保留原文，请核对。	Content coverage could not be confirmed. The original has been kept for review.	整理結果的內容涵蓋尚未確認，已保留原文，請核對。	整理結果に内容が網羅されているか確認できません。原文を保持しました。確認してください。
+AI补充	AI补充	AI addition	AI 補充	AIによる補足
+已整理 {}/{} 节，应用时仅保存已完成部分。	已整理 {}/{} 节，应用时仅保存已完成部分。	Organized {}/{} sections. Applying saves only completed sections.	已整理 {}/{} 節，套用時僅儲存已完成部分。	{}/{} 節を整理しました。適用すると完了した節のみ保存されます。
+查看原文 {}	查看原文 {}	View source {}	查看原文 {}	原文を表示 {}
+查看预览	查看预览	View preview	查看預覽	プレビューを表示
+重新加载学习笔记	重新加载学习笔记	Reload learning notes	重新載入學習筆記	学習ノートを再読み込み
+放弃预览并重新加载	放弃预览并重新加载	Discard preview and reload	捨棄預覽並重新載入	プレビューを破棄して再読み込み

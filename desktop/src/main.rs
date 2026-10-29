@@ -40,6 +40,7 @@ mod settings_ui;
 mod source;
 mod storage;
 mod storage_ui;
+mod study_ui;
 mod subtitle_timing;
 mod task_runner;
 mod task_ui;
@@ -197,6 +198,7 @@ struct Desktop {
     onboarding: onboarding::State,
     storage_ui: storage_ui::State,
     reader_ui: reader_ui::State,
+    study_ui: study_ui::StudyState,
     workspace: Option<workspace::Workspace>,
     workspace_error: Option<String>,
     preference_defaults_pending: bool,
@@ -594,12 +596,14 @@ impl Desktop {
         let settings_ui = settings_ui::State::new(window, cx);
         let onboarding = onboarding::State::new(window, cx);
         let reader_ui = reader_ui::State::new(window, cx);
+        let study_ui = study_ui::StudyState::new(window, cx);
         let mut this = Self {
             source_placeholder_fit: Default::default(),
             preferences,
             settings_ui,
             onboarding,
             reader_ui,
+            study_ui,
             storage_ui: Default::default(),
             workspace,
             workspace_error,

@@ -44,6 +44,10 @@ Paste a link or drag a file onto **Home**, the start page (click the course2md l
 
 The reader opens on a summary and key points, keeps an outline of the sections beside the note, and finds text across the whole note. Formulas are typeset, and copying a passage gives you the original text with each formula's LaTeX.
 
+Open **Learning notes** to keep the original on the left and preview organized notes on the right, or switch tabs in a narrow window. **Organize section** and **Organize all** use the original text and its screenshots to remove redundancy, then check for missing substance. Uncertain results keep the original and flag it for review. You can also generate a learning summary with links to source sections.
+
+Select original text, choose **Ask about selection**, and enter a question. An answer becomes a cited AI addition only when you choose **Add to organized notes**. Organized notes and summaries also require confirmation before saving; they never replace the original, and reorganizing preserves saved answers. These actions send the relevant text and screenshots to your default AI service and require an image-capable model. Learning content is saved separately in `study.json` inside the note version directory; existing exports still export the original note.
+
 ### Browse every slide
 
 The **Screenshots** view shows the whole lecture at a glance. Open any slide to see it large, zoom and pan, and read what was said at that moment.

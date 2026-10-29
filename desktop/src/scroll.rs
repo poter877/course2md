@@ -2,6 +2,9 @@
 use std::process::{Command, Stdio};
 use std::thread;
 
+/// Stable clearance for overlay scrollbars in reader content and controls.
+pub(crate) const GUTTER: gpui::Pixels = gpui::px(14.);
+
 /// macOS「始终显示滚动条」系统偏好（states-and-motion 滚动条契约要求尊重该偏好）。
 /// 首次调用在后台线程读取 `defaults`，渲染期只读缓存值；读到之前与非 macOS 均按
 /// Automatic（滚动时显示）。

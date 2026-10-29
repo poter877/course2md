@@ -1,6 +1,8 @@
 //! Reading navigation is bound to one immutable note version, independently of exports.
 use super::*;
-use crate::{notes::PreviewBlock, reader_navigation as nav, theme::*};
+use crate::{
+    notes::PreviewBlock, reader_navigation as nav, scroll::GUTTER as SCROLLBAR_GUTTER, theme::*,
+};
 use gpui_component::{
     button::*,
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
@@ -16,8 +18,6 @@ use std::{
 
 /// Reading copy: 17px with a 1.8 line, in the interface face.
 const READER_BODY: Rems = rems(17. / 14.);
-/// Space kept between scrolled text and an always-visible scrollbar.
-const SCROLLBAR_GUTTER: Pixels = px(14.);
 /// The icon of an empty state.
 const EMPTY_STATE_ICON: Rems = rems(32. / 14.);
 /// Minimum spacing between polled reading-position saves during scrolling.
@@ -3247,6 +3247,9 @@ impl Desktop {
         .detach();
     }
     pub fn open_reader_find(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.study_ui.enabled {
+            self.suspend_study();
+        }
         if self.preview.is_none() {
             return;
         }
@@ -3888,6 +3891,7 @@ impl Desktop {
             return;
         }
         // Invalidate at navigation start, before an old worker can finish.
+        self.suspend_study();
         if self.reader_ui.ai_edit.busy() || !refresh {
             self.reader_ui.ai_edit.reset();
         } else {
@@ -4319,6 +4323,9 @@ impl Desktop {
             return (self.reader_opening(cx), None);
         };
         self.reader_ui.images.next_frame();
+        if self.study_ui.enabled {
+            return (self.study_page(window, cx), None);
+        }
         self.schedule_reader_restore(window, cx);
         let outline = self.reader_ui.outline.clone();
         let metrics = ReaderMetrics::new(window, self.result_tab, !outline.is_empty());
@@ -5237,6 +5244,16 @@ impl Desktop {
         );
         let mut compact_search = None;
         let mut short_matches = None;
+        toolbar = toolbar.child(
+            outline_pill("reader-open-study", cx)
+                .icon(icons::notebook())
+                .when(!icon_only, |button| {
+                    button.label(course2md::tr!("学习笔记"))
+                })
+                .accessibility_label(course2md::tr!("学习笔记"))
+                .tooltip(course2md::tr!("学习笔记"))
+                .on_click(cx.listener(|this, _, window, cx| this.open_study(window, cx))),
+        );
         // The screenshot view carries its own search above the grid.
         if reading_note {
             if self.reader_ui.find.open {
@@ -6978,8 +6995,62 @@ impl Desktop {
     }
     /// Leaving the reader releases its decoded screenshots.
     pub(crate) fn release_reader_images(&mut self, cx: &mut Context<Self>) {
+        self.suspend_study();
         self.reader_ui.ai_edit.reset();
         self.reader_ui.images.clear(cx);
+    }
+
+    pub(crate) fn reader_stop_ai_for_study(&mut self) {
+        self.reader_ui.ai_edit.reset();
+    }
+
+    /// Study paths were validated on the loading worker; drawing only uses the
+    /// shared bounded decoder/cache and never inspects files synchronously.
+    pub(crate) fn study_reader_figure(
+        &mut self,
+        path: Option<&std::path::Path>,
+        device_width: f32,
+        id: SharedString,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let picture = path.map(|path| {
+            self.reader_ui.images.get(
+                path,
+                crate::reader_images::Size::thumbnail(device_width),
+                Self::reader_images,
+                cx,
+            )
+        });
+        let frame = path.and_then(|path| self.reader_ui.frame_by_path.get(path).copied());
+        div()
+            .id(id.clone())
+            .relative()
+            .w_full()
+            .aspect_ratio(16. / 9.)
+            .rounded(FIGURE_RADIUS)
+            .overflow_hidden()
+            .bg(color(SURFACE_HIGH))
+            .map(|figure| match picture {
+                Some(crate::reader_images::Loaded::Ready(image, _)) => figure.child(
+                    img(image)
+                        .absolute()
+                        .inset_0()
+                        .size_full()
+                        .object_fit(ObjectFit::Contain),
+                ),
+                Some(crate::reader_images::Loaded::Pending) => {
+                    figure.child(screenshot_placeholder())
+                }
+                _ => figure.child(unreadable_screenshot(id).absolute().inset_0()),
+            })
+            .when_some(frame, |figure, index| {
+                figure.cursor_pointer().on_click(
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_reader_image(index, window, cx)
+                    }),
+                )
+            })
+            .into_any_element()
     }
     /// Where the reader keeps its decoded screenshots.
     fn reader_images(this: &mut Self) -> &mut crate::reader_images::ReaderImages {
